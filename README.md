@@ -2,6 +2,14 @@
 
 A ComfyUI custom node that extracts prompts from your images and workflow JSON files.
 
+## Screenshots
+
+### The Node
+![meta_prompt_extractor](https://raw.githubusercontent.com/ialhabbal/meta_prompt_extractor/main/media/the_node.png)
+
+### Browser Window
+![meta_prompt_extractor](https://raw.githubusercontent.com/ialhabbal/meta_prompt_extractor/main/media/browser_window.png)
+
 ## What It Does
 
 The **Meta Prompt Extractor** reads hidden metadata embedded in image files and workflow documents, then extracts:
