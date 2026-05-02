@@ -231,6 +231,186 @@ def parse_a1111_parameters(parameters_text):
     return result
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Metadata normalisation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# These three functions form a single normalisation layer that sits between
+# the raw bytes/strings returned by image readers / JS cache and the
+# parse_workflow_for_prompts() business logic.
+#
+# Problem they solve
+# ──────────────────
+# ComfyUI PNG metadata stores "workflow" and "prompt" as raw JSON *strings*
+# inside text chunks.  When JavaScript reads these chunks and caches them, the
+# values may arrive as:
+#   • already-parsed dicts   (JS parsed them)
+#   • raw JSON strings       (JS forwarded them verbatim)
+#   • double-encoded strings (JSON string whose value is another JSON string)
+#   • None / missing keys    (different tools use different key names)
+#
+# parse_workflow_for_prompts() guards with `isinstance(workflow_data, dict)`,
+# so if a value is a string the entire workflow-graph path is silently skipped.
+# These helpers guarantee that callers always receive plain Python dicts.
+
+TAG_META = "[MetaPromptExtractor]"   # shared debug prefix
+
+
+def _coerce_to_dict(value, label="value"):
+    """
+    Coerce *value* to a dict, parsing JSON when necessary.
+    Returns the dict on success, None on any failure.
+    *label* is only used for debug messages.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                return parsed
+            # Double-encoded: outer value is a JSON string whose content is
+            # another JSON string.
+            if isinstance(parsed, str):
+                try:
+                    inner = json.loads(parsed)
+                    if isinstance(inner, dict):
+                        print(f"{TAG_META} _coerce_to_dict: double-encoded JSON unwrapped "
+                              f"in {label}")
+                        return inner
+                except Exception:
+                    pass
+            print(f"{TAG_META} _coerce_to_dict: {label} parsed to "
+                  f"{type(parsed).__name__}, not dict — ignoring")
+            return None
+        except json.JSONDecodeError as exc:
+            print(f"{TAG_META} _coerce_to_dict: JSON error in {label}: {exc}")
+            return None
+    print(f"{TAG_META} _coerce_to_dict: unexpected type "
+          f"{type(value).__name__} for {label}")
+    return None
+
+
+def _get_workflow_data(metadata):
+    """
+    Robustly extract a usable workflow/prompt dict from a raw metadata mapping.
+
+    Priority
+    ────────
+    1. metadata["workflow"] / metadata["Workflow"]   → coerce to dict
+    2. metadata["prompt"]   / metadata["Prompt"]     → coerce to dict
+    3. Scan ALL values: first JSON string starting with "{"
+       that parses to a dict with numeric keys OR a "nodes" key
+       (catches non-standard chunk names written by third-party tools)
+
+    Debug output
+    ────────────
+    Always prints:
+      • metadata keys found
+      • which key (if any) yielded a workflow dict
+      • node / key count of the result
+    """
+    if not metadata or not isinstance(metadata, dict):
+        print(f"{TAG_META} _get_workflow_data: metadata is empty or "
+              f"not a dict (type={type(metadata).__name__})")
+        return None
+
+    print(f"{TAG_META} _get_workflow_data: metadata keys = {list(metadata.keys())}")
+
+    # ── Pass 1: canonical key names ───────────────────────────────────────────
+    for key in ("workflow", "Workflow", "prompt", "Prompt"):
+        raw = metadata.get(key)
+        if raw is None:
+            continue
+        result = _coerce_to_dict(raw, label=f"metadata[{key!r}]")
+        if result is not None:
+            node_count      = len(result)
+            has_nodes_array = "nodes" in result
+            has_numeric     = any(str(k).isdigit() for k in result)
+            print(f"{TAG_META} _get_workflow_data: found via key={key!r}  "
+                  f"keys={node_count}  "
+                  f"has_nodes_array={has_nodes_array}  "
+                  f"has_numeric_keys={has_numeric}")
+            return result
+
+    # ── Pass 2: exhaustive scan of all string values ──────────────────────────
+    print(f"{TAG_META} _get_workflow_data: canonical keys empty — scanning all values")
+    for key, raw in metadata.items():
+        if not isinstance(raw, str):
+            continue
+        stripped = raw.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        has_numeric     = any(str(k).isdigit() for k in parsed)
+        has_nodes_array = "nodes" in parsed
+        if has_numeric or has_nodes_array:
+            print(f"{TAG_META} _get_workflow_data: found via scan key={key!r}  "
+                  f"keys={len(parsed)}  "
+                  f"has_nodes_array={has_nodes_array}  "
+                  f"has_numeric_keys={has_numeric}")
+            return parsed
+
+    print(f"{TAG_META} _get_workflow_data: no workflow data found in any metadata key")
+    return None
+
+
+def _normalise_metadata_pair(prompt_data, workflow_data):
+    """
+    Ensure both halves of the (prompt_data, workflow_data) pair are either
+    plain Python dicts or None.
+
+    Handles:
+    • JSON strings  → parsed to dicts
+    • Wrapper dicts that contain *both* "prompt" and "workflow" sub-keys
+      (e.g. {"prompt": {...}, "workflow": {...}}) — unwrapped automatically
+    • Anything else → None
+    """
+    # ── Pass 1: coerce strings ────────────────────────────────────────────────
+    if isinstance(prompt_data, str):
+        prompt_data = _coerce_to_dict(prompt_data, "prompt_data string")
+    if isinstance(workflow_data, str):
+        workflow_data = _coerce_to_dict(workflow_data, "workflow_data string")
+
+    # ── Pass 2: unwrap wrapper dicts ─────────────────────────────────────────
+    # A single dict like {"prompt": {...}, "workflow": {...}} may arrive on
+    # either side.  Detect and split it.
+    for candidate, side in [(prompt_data, "prompt_data"),
+                             (workflow_data, "workflow_data")]:
+        if not isinstance(candidate, dict):
+            continue
+        inner_p = candidate.get("prompt") or candidate.get("Prompt")
+        inner_w = candidate.get("workflow") or candidate.get("Workflow")
+        if inner_p is not None or inner_w is not None:
+            print(f"{TAG_META} _normalise_metadata_pair: unwrapping {side} wrapper")
+            if inner_p is not None and candidate is prompt_data:
+                prompt_data = (inner_p if isinstance(inner_p, dict)
+                               else _coerce_to_dict(inner_p, "unwrapped prompt"))
+            if inner_w is not None and (workflow_data is None
+                                        or candidate is workflow_data):
+                workflow_data = (inner_w if isinstance(inner_w, dict)
+                                 else _coerce_to_dict(inner_w, "unwrapped workflow"))
+            break
+
+    # ── Pass 3: final type gate ───────────────────────────────────────────────
+    if not isinstance(prompt_data, dict):
+        prompt_data = None
+    if not isinstance(workflow_data, dict):
+        workflow_data = None
+
+    return prompt_data, workflow_data
+
+
 def extract_metadata_from_png(file_path):
     """Extract workflow/prompt metadata from PNG file (cached from JavaScript)"""
     try:
@@ -257,16 +437,10 @@ def extract_metadata_from_png(file_path):
             print(f"[PromptExtractor] Using cached PNG metadata for: {cache_key}")
 
             if isinstance(metadata, dict):
-                prompt_data = metadata.get('prompt')
-                workflow_data = metadata.get('workflow')
-
-                # Check if we have parsed A1111 parameters
-                # Return both parsed parameters AND workflow data (workflow needed for JSON export)
+                # ── A1111 / Forge parameters (JS pre-parsed) ──────────────────
                 if metadata.get('parsed_parameters'):
                     print("[PromptExtractor] Found parsed A1111 parameters")
                     parsed = metadata['parsed_parameters']
-                    # JS parser doesn't extract sampler/resolution/modules — enrich
-                    # from the raw parameters text via the Python parser.
                     raw_params = metadata.get('parameters', '')
                     if raw_params:
                         py_parsed = parse_a1111_parameters(raw_params)
@@ -275,7 +449,31 @@ def extract_metadata_from_png(file_path):
                                       'seed', 'width', 'height', 'modules'):
                                 if k in py_parsed and k not in parsed:
                                     parsed[k] = py_parsed[k]
+                    # workflow_data may still exist alongside A1111 params
+                    raw_wf = metadata.get('workflow') or metadata.get('Workflow')
+                    workflow_data = _coerce_to_dict(raw_wf, "cached workflow alongside A1111")
                     return parsed, workflow_data
+
+                # ── ComfyUI workflow / prompt ──────────────────────────────────
+                # Use _get_workflow_data so JSON-string values and non-standard
+                # key names are all handled in one place.
+                workflow_data = _get_workflow_data(metadata)
+
+                # prompt_data is the execution graph ({node_id: {class_type, inputs}}).
+                raw_prompt = metadata.get('prompt') or metadata.get('Prompt')
+                prompt_data = (_coerce_to_dict(raw_prompt, "cached prompt")
+                               if raw_prompt is not None else None)
+
+                # If _get_workflow_data surfaced the execution graph (numeric keys,
+                # no 'nodes' array) and prompt_data is still missing, promote it.
+                if (workflow_data is not None
+                        and 'nodes' not in workflow_data
+                        and prompt_data is None):
+                    has_numeric = any(str(k).isdigit() for k in workflow_data)
+                    if has_numeric:
+                        print(f"{TAG_META} PNG cache: execution graph promoted "
+                              "to prompt_data")
+                        prompt_data, workflow_data = workflow_data, None
 
                 return prompt_data, workflow_data
 
@@ -287,51 +485,48 @@ def extract_metadata_from_png(file_path):
         with Image.open(file_path) as img:
             metadata = img.info
 
-            # Debug: Print all metadata keys found
+            # ── Debug: all metadata keys ──────────────────────────────────────
             print(f"[PromptExtractor] PNG metadata keys: {list(metadata.keys())}")
 
-            # ComfyUI stores data in 'prompt' and 'workflow' text chunks
-            prompt_data = metadata.get('prompt')
-            workflow_data = metadata.get('workflow')
+            # ── A1111 / Forge parameters (plain text, not JSON) ───────────────
+            raw_params = (metadata.get('parameters') or metadata.get('Parameters')
+                          or metadata.get('Comment') or metadata.get('comment'))
+            if isinstance(raw_params, str) and (
+                    'Negative prompt:' in raw_params or '<lora:' in raw_params):
+                print("[PromptExtractor] Detected A1111 parameters format, parsing...")
+                parsed = parse_a1111_parameters(raw_params)
+                if parsed:
+                    print(f"[PromptExtractor] Parsed "
+                          f"{len(parsed.get('loras', []))} LoRAs from A1111 parameters")
+                    workflow_json = _get_workflow_data(dict(metadata))
+                    return parsed, workflow_json
 
-            # Also check for alternative key names (some tools use different names)
-            if not prompt_data:
-                prompt_data = metadata.get('Prompt') or metadata.get('parameters') or metadata.get('Comment')
-            if not workflow_data:
-                workflow_data = metadata.get('Workflow')
+            # ── ComfyUI workflow / prompt ──────────────────────────────────────
+            # _get_workflow_data handles all key variants and JSON coercion.
+            workflow_json = _get_workflow_data(dict(metadata))
 
-            # Debug: Show if we found anything
-            print(f"[PromptExtractor] prompt_data found: {prompt_data is not None}, workflow_data found: {workflow_data is not None}")
-            if prompt_data:
-                print(f"[PromptExtractor] prompt_data preview: {str(prompt_data)[:200]}...")
-            if workflow_data:
-                print(f"[PromptExtractor] workflow_data preview: {str(workflow_data)[:200]}...")
+            raw_prompt = metadata.get('prompt') or metadata.get('Prompt')
+            prompt_json = (_coerce_to_dict(raw_prompt, "PIL prompt chunk")
+                           if raw_prompt else None)
 
-            # Parse JSON if present
-            prompt_json = None
-            workflow_json = None
+            # Debug
+            print(f"[PromptExtractor] prompt_data found: {prompt_json is not None}, "
+                  f"workflow_data found: {workflow_json is not None}")
+            if prompt_json:
+                print(f"[PromptExtractor] prompt_data keys preview: "
+                      f"{str(list(prompt_json.keys()))[:120]}")
+            if workflow_json:
+                node_count = len(workflow_json.get('nodes', workflow_json))
+                print(f"[PromptExtractor] workflow_data node/key count: {node_count}")
 
-            if prompt_data:
-                try:
-                    prompt_json = json.loads(prompt_data) if isinstance(prompt_data, str) else prompt_data
-                except json.JSONDecodeError as e:
-                    print(f"[PromptExtractor] Failed to parse prompt JSON: {e}")
-                    # Check if it's A1111 parameters format
-                    if isinstance(prompt_data, str) and ('Negative prompt:' in prompt_data or '<lora:' in prompt_data):
-                        print("[PromptExtractor] Detected A1111 parameters format, parsing...")
-                        parsed = parse_a1111_parameters(prompt_data)
-                        if parsed:
-                            prompt_json = parsed
-                            print(f"[PromptExtractor] Parsed {len(parsed.get('loras', []))} LoRAs from A1111 parameters")
-                    else:
-                        # Plain text prompt (fallback)
-                        prompt_json = {'positive': prompt_data}
-
-            if workflow_data:
-                try:
-                    workflow_json = json.loads(workflow_data) if isinstance(workflow_data, str) else workflow_data
-                except json.JSONDecodeError as e:
-                    print(f"[PromptExtractor] Failed to parse workflow JSON: {e}")
+            # Promote execution-graph when no separate prompt_json
+            if (workflow_json is not None
+                    and 'nodes' not in workflow_json
+                    and prompt_json is None):
+                has_numeric = any(str(k).isdigit() for k in workflow_json)
+                if has_numeric:
+                    print(f"{TAG_META} PIL: execution graph promoted to prompt_json")
+                    prompt_json, workflow_json = workflow_json, None
 
             return prompt_json, workflow_json
     except Exception as e:
@@ -361,13 +556,24 @@ def extract_metadata_from_jpeg(file_path):
             print(f"[PromptExtractor] Using cached JPEG/WebP metadata for: {cache_key}")
 
             if isinstance(metadata, dict):
-                # Check for prompt/workflow structure
-                if 'prompt' in metadata and 'workflow' in metadata:
-                    return metadata.get('prompt'), metadata.get('workflow')
-                elif 'workflow' in metadata:
-                    return None, metadata.get('workflow')
-                else:
-                    return metadata, None
+                # Use _get_workflow_data for consistent extraction regardless of
+                # which key names the cache used or whether values are strings.
+                workflow_data = _get_workflow_data(metadata)
+                raw_prompt = metadata.get('prompt') or metadata.get('Prompt')
+                prompt_data = (_coerce_to_dict(raw_prompt, "cached JPEG prompt")
+                               if raw_prompt is not None else None)
+
+                # Promote execution-graph when no separate prompt_data
+                if (workflow_data is not None
+                        and 'nodes' not in workflow_data
+                        and prompt_data is None):
+                    has_numeric = any(str(k).isdigit() for k in workflow_data)
+                    if has_numeric:
+                        print(f"{TAG_META} JPEG cache: execution graph promoted "
+                              "to prompt_data")
+                        prompt_data, workflow_data = workflow_data, None
+
+                return prompt_data, workflow_data
         else:
             print(f"[PromptExtractor] No cached metadata found for JPEG/WebP: {file_path}")
             print("[PromptExtractor] Note: Image metadata is read by JavaScript when file is selected")
@@ -378,64 +584,59 @@ def extract_metadata_from_jpeg(file_path):
 
         print(f"[PromptExtractor] Falling back to PIL for: {file_path}")
         with Image.open(file_path) as img:
-            # Try EXIF data
+            # Collect all EXIF / info fields into one flat dict so that
+            # _get_workflow_data can scan them in a single pass.
+            combined_meta = {}
+
+            # ── EXIF tags ─────────────────────────────────────────────────────
             exif = img.getexif()
             if exif:
-                prompt_data = None
-                workflow_data = None
-
-                # ComfyUI stores metadata in EXIF tags:
-                # 0x010e (ImageDescription): "Workflow: {json}"
-                # 0x010f (Make): "Prompt: {json}"
-                for tag_id in (0x010e, 0x010f):
+                for tag_id in (0x010e, 0x010f):   # ImageDescription, Make
                     tag_val = exif.get(tag_id)
-                    if tag_val:
-                        if isinstance(tag_val, bytes):
-                            tag_val = tag_val.decode('utf-8', errors='ignore')
-                        tag_val = tag_val.strip().rstrip('\x00')
-                        if tag_val.startswith('Workflow:'):
-                            json_str = tag_val[len('Workflow:'):].strip()
-                            try:
-                                workflow_data = json.loads(json_str)
-                            except:
-                                pass
-                        elif tag_val.startswith('Prompt:'):
-                            json_str = tag_val[len('Prompt:'):].strip()
-                            try:
-                                prompt_data = json.loads(json_str)
-                            except:
-                                pass
+                    if not tag_val:
+                        continue
+                    if isinstance(tag_val, bytes):
+                        tag_val = tag_val.decode('utf-8', errors='ignore')
+                    tag_val = tag_val.strip().rstrip('\x00')
+                    if tag_val.startswith('Workflow:'):
+                        combined_meta['workflow'] = tag_val[len('Workflow:'):].strip()
+                    elif tag_val.startswith('Prompt:'):
+                        combined_meta['prompt'] = tag_val[len('Prompt:'):].strip()
 
-                if prompt_data or workflow_data:
-                    return prompt_data, workflow_data
-
-                # Fallback: UserComment field (0x9286) - used by some tools
+                # UserComment (0x9286) — may be a wrapper {"prompt":…,"workflow":…}
                 user_comment = exif.get(0x9286)
                 if user_comment:
-                    # Try to parse as JSON
-                    try:
-                        if isinstance(user_comment, bytes):
-                            user_comment = user_comment.decode('utf-8', errors='ignore')
-                        # Remove potential UNICODE prefix
-                        if user_comment.startswith('UNICODE'):
-                            user_comment = user_comment[7:].lstrip('\x00')
-                        data = json.loads(user_comment)
-                        return data.get('prompt'), data.get('workflow')
-                    except:
-                        pass
+                    if isinstance(user_comment, bytes):
+                        user_comment = user_comment.decode('utf-8', errors='ignore')
+                    if user_comment.startswith('UNICODE'):
+                        user_comment = user_comment[7:].lstrip('\x00')
+                    parsed_uc = _coerce_to_dict(user_comment, "EXIF UserComment")
+                    if isinstance(parsed_uc, dict):
+                        combined_meta.update(parsed_uc)
 
-            # Try ImageDescription
+            # ── img.info text chunks ──────────────────────────────────────────
             if hasattr(img, 'info'):
-                for key in ['prompt', 'workflow', 'parameters', 'Comment']:
-                    if key in img.info:
-                        try:
-                            data = json.loads(img.info[key])
-                            if isinstance(data, dict):
-                                return data, None
-                        except:
-                            pass
+                for k, v in img.info.items():
+                    if k not in combined_meta:
+                        combined_meta[k] = v
 
-            return None, None
+            print(f"[PromptExtractor] JPEG/WebP combined metadata keys: "
+                  f"{list(combined_meta.keys())}")
+
+            workflow_data = _get_workflow_data(combined_meta)
+            raw_prompt = combined_meta.get('prompt') or combined_meta.get('Prompt')
+            prompt_data = (_coerce_to_dict(raw_prompt, "JPEG prompt")
+                           if raw_prompt is not None else None)
+
+            if (workflow_data is not None
+                    and 'nodes' not in workflow_data
+                    and prompt_data is None):
+                has_numeric = any(str(k).isdigit() for k in workflow_data)
+                if has_numeric:
+                    print(f"{TAG_META} JPEG PIL: execution graph promoted to prompt_data")
+                    prompt_data, workflow_data = workflow_data, None
+
+            return prompt_data, workflow_data
     except Exception as e:
         print(f"[PromptExtractor] Error reading JPEG/WebP metadata: {e}")
         return None, None
@@ -466,22 +667,31 @@ def extract_metadata_from_json(file_path):
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-        print(f"[PromptExtractor] JSON loaded, type: {type(data)}, keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+        print(f"[PromptExtractor] JSON loaded, type: {type(data)}, "
+              f"keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
 
-        # Check if it's a workflow format (has nodes) or prompt format
+        # Normalise the loaded data — it may be a wrapper dict, an API-format
+        # execution graph, a workflow-format graph, or something else entirely.
         if isinstance(data, dict):
-            # API format (prompt) - node_id: {class_type, inputs}
+            # ── Wrapper: {"prompt": ..., "workflow": ...} ─────────────────────
+            if 'prompt' in data or 'workflow' in data:
+                print("[PromptExtractor] JSON detected as wrapped format")
+                raw_p = data.get('prompt')
+                raw_w = data.get('workflow')
+                prompt_out  = _coerce_to_dict(raw_p, "JSON prompt key")  if raw_p is not None else None
+                workflow_out = _coerce_to_dict(raw_w, "JSON workflow key") if raw_w is not None else None
+                return prompt_out, workflow_out
+
+            # ── Workflow format: has 'nodes' array ────────────────────────────
+            if 'nodes' in data:
+                print(f"[PromptExtractor] JSON detected as workflow format with "
+                      f"{len(data.get('nodes', []))} nodes")
+                return None, data
+
+            # ── API / execution-graph format: values are {class_type, inputs} ─
             if any(isinstance(v, dict) and 'class_type' in v for v in data.values()):
                 print("[PromptExtractor] JSON detected as API/prompt format")
                 return data, None
-            # Workflow format - has 'nodes' array
-            if 'nodes' in data:
-                print(f"[PromptExtractor] JSON detected as workflow format with {len(data.get('nodes', []))} nodes")
-                return None, data
-            # Could be wrapped
-            if 'prompt' in data:
-                print("[PromptExtractor] JSON detected as wrapped format")
-                return data.get('prompt'), data.get('workflow')
 
         print("[PromptExtractor] JSON format not recognized, returning as-is")
         return data, None
@@ -1626,7 +1836,28 @@ def parse_workflow_for_prompts(prompt_data, workflow_data=None):
     if not prompt_data and not workflow_data:
         return result
 
-    # Check if prompt_data is parsed A1111 parameters (from JavaScript)
+    # ── Normalise inputs: ensure dicts, never raw JSON strings ───────────────
+    # This is the last-chance safety net: even if an extract_metadata_from_*
+    # function returned a string instead of a parsed dict, _normalise_metadata_pair
+    # will parse it here so the rest of the function always sees plain dicts.
+    prompt_data, workflow_data = _normalise_metadata_pair(prompt_data, workflow_data)
+
+    if not prompt_data and not workflow_data:
+        print(f"{TAG_META} parse_workflow_for_prompts: both inputs are None "
+              "after normalisation — nothing to extract")
+        return result
+
+    # ── Debug: report what we received after normalisation ───────────────────
+    if workflow_data:
+        wf_count        = len(workflow_data.get('nodes', workflow_data))
+        has_nodes_array = 'nodes' in workflow_data
+        print(f"{TAG_META} parse_workflow_for_prompts: workflow_data present — "
+              f"node/key count={wf_count}  has_nodes_array={has_nodes_array}")
+    if prompt_data:
+        pd_count    = len(prompt_data)
+        has_numeric = any(str(k).isdigit() for k in prompt_data)
+        print(f"{TAG_META} parse_workflow_for_prompts: prompt_data present — "
+              f"key count={pd_count}  has_numeric_keys={has_numeric}")
     if isinstance(prompt_data, dict) and 'prompt' in prompt_data and 'loras' in prompt_data:
         print("[PromptExtractor] Processing A1111 parsed parameters")
         result['positive_prompt'] = prompt_data.get('prompt', '')
@@ -2433,24 +2664,41 @@ def parse_workflow_for_prompts(prompt_data, workflow_data=None):
     # ========================================
     # GRAPH-TRAVERSAL PASS (API / prompt-dict format)
     # ========================================
-    # Run the sampler-anchored recursive traversal when:
-    #   • We are working from prompt_data (execution graph), AND
-    #   • The standard iteration above did not yet find prompts.
+    # Run the sampler-anchored recursive traversal whenever we have an
+    # API-format execution graph (data), regardless of whether the
+    # standard loop above already found prompts.
     #
-    # This handles custom nodes (Prompt Verify, TextMultiline, etc.) and
-    # chained pipelines where the text never lands directly in a
-    # CLIPTextEncode.inputs["text"] string.
-    if data and (not positive_prompts or not negative_prompts):
+    # Rationale: the standard loop cannot determine positive vs negative
+    # direction without workflow_data / node_map (which require the
+    # human-facing "workflow" chunk, not just the "prompt" chunk).
+    # Without direction data it puts *all* CLIPTextEncode nodes into
+    # positive_prompts.  The sampler-anchored traversal below always
+    # resolves direction correctly by following positive/negative inputs
+    # from the KSampler anchor.
+    #
+    # Strategy:
+    #   1. Always run traversal when data is present.
+    #   2. If traversal found prompts → use them (they have correct direction).
+    #   3. If traversal found nothing → keep whatever the standard loop found.
+    if data:
         try:
             gt_pos, gt_neg = _extract_prompts_via_graph_traversal(data)
-            if gt_pos and not positive_prompts:
-                print(f"{TAG} [graph-traversal] Using traversal positive prompt ({len(gt_pos)} chars)")
-                positive_prompts.append(gt_pos)
-            if gt_neg and not negative_prompts:
-                print(f"{TAG} [graph-traversal] Using traversal negative prompt ({len(gt_neg)} chars)")
-                negative_prompts.append(gt_neg)
+            if gt_pos or gt_neg:
+                # Traversal succeeded with correct direction — override loop results
+                if gt_pos:
+                    print(f"{TAG} [graph-traversal] Using traversal positive "
+                          f"({len(gt_pos)} chars)")
+                    positive_prompts = [gt_pos]
+                if gt_neg:
+                    print(f"{TAG} [graph-traversal] Using traversal negative "
+                          f"({len(gt_neg)} chars)")
+                    negative_prompts = [gt_neg]
+            else:
+                # Traversal found nothing — keep standard loop results as-is
+                print(f"{TAG} [graph-traversal] No result from traversal; "
+                      "keeping standard-loop prompts")
         except Exception as _gt_err:
-            print(f"{TAG} [graph-traversal] Error during traversal (non-fatal): {_gt_err}")
+            print(f"{TAG} [graph-traversal] Error (non-fatal): {_gt_err}")
 
     # Also check for LoRA syntax in prompts: <lora:name:strength>
     # Skip this if we already extracted LoRAs from workflow chains
