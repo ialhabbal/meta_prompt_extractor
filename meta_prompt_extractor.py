@@ -235,33 +235,17 @@ def parse_a1111_parameters(parameters_text):
 # Metadata normalisation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# These three functions form a single normalisation layer that sits between
-# the raw bytes/strings returned by image readers / JS cache and the
-# parse_workflow_for_prompts() business logic.
-#
-# Problem they solve
-# ──────────────────
-# ComfyUI PNG metadata stores "workflow" and "prompt" as raw JSON *strings*
-# inside text chunks.  When JavaScript reads these chunks and caches them, the
-# values may arrive as:
-#   • already-parsed dicts   (JS parsed them)
-#   • raw JSON strings       (JS forwarded them verbatim)
-#   • double-encoded strings (JSON string whose value is another JSON string)
-#   • None / missing keys    (different tools use different key names)
-#
-# parse_workflow_for_prompts() guards with `isinstance(workflow_data, dict)`,
-# so if a value is a string the entire workflow-graph path is silently skipped.
-# These helpers guarantee that callers always receive plain Python dicts.
+# ComfyUI stores "workflow" and "prompt" as raw JSON *strings* inside PNG text
+# chunks.  When JS caches these, values may arrive as already-parsed dicts OR
+# as raw JSON strings.  parse_workflow_for_prompts() guards with
+# `isinstance(workflow_data, dict)`, so a string silently skips the entire
+# workflow path.  These helpers guarantee callers always receive plain dicts.
 
-TAG_META = "[MetaPromptExtractor]"   # shared debug prefix
+TAG_META = "[MetaPromptExtractor]"
 
 
 def _coerce_to_dict(value, label="value"):
-    """
-    Coerce *value* to a dict, parsing JSON when necessary.
-    Returns the dict on success, None on any failure.
-    *label* is only used for debug messages.
-    """
+    """Coerce *value* to a dict (parsing JSON if needed). Returns None on failure."""
     if value is None:
         return None
     if isinstance(value, dict):
@@ -274,46 +258,36 @@ def _coerce_to_dict(value, label="value"):
             parsed = json.loads(stripped)
             if isinstance(parsed, dict):
                 return parsed
-            # Double-encoded: outer value is a JSON string whose content is
-            # another JSON string.
+            # Double-encoded: outer string whose value is another JSON string
             if isinstance(parsed, str):
                 try:
                     inner = json.loads(parsed)
                     if isinstance(inner, dict):
-                        print(f"{TAG_META} _coerce_to_dict: double-encoded JSON unwrapped "
-                              f"in {label}")
+                        print(f"{TAG_META} _coerce_to_dict: double-encoded JSON in {label}")
                         return inner
                 except Exception:
                     pass
             print(f"{TAG_META} _coerce_to_dict: {label} parsed to "
-                  f"{type(parsed).__name__}, not dict — ignoring")
+                  f"{type(parsed).__name__}, not dict")
             return None
         except json.JSONDecodeError as exc:
             print(f"{TAG_META} _coerce_to_dict: JSON error in {label}: {exc}")
             return None
-    print(f"{TAG_META} _coerce_to_dict: unexpected type "
-          f"{type(value).__name__} for {label}")
+    print(f"{TAG_META} _coerce_to_dict: unexpected type {type(value).__name__} for {label}")
     return None
 
 
 def _get_workflow_data(metadata):
     """
-    Robustly extract a usable workflow/prompt dict from a raw metadata mapping.
+    Robustly extract a workflow/prompt dict from a raw metadata mapping.
 
-    Priority
-    ────────
-    1. metadata["workflow"] / metadata["Workflow"]   → coerce to dict
-    2. metadata["prompt"]   / metadata["Prompt"]     → coerce to dict
-    3. Scan ALL values: first JSON string starting with "{"
-       that parses to a dict with numeric keys OR a "nodes" key
-       (catches non-standard chunk names written by third-party tools)
+    Priority:
+      1. metadata["workflow"] / ["Workflow"]  → coerce to dict
+      2. metadata["prompt"]   / ["Prompt"]    → coerce to dict
+      3. Scan ALL values: first JSON string starting with "{" that parses to a
+         dict with numeric keys OR a "nodes" key (non-standard chunk names)
 
-    Debug output
-    ────────────
-    Always prints:
-      • metadata keys found
-      • which key (if any) yielded a workflow dict
-      • node / key count of the result
+    Always prints: metadata keys, which key succeeded, node/key count.
     """
     if not metadata or not isinstance(metadata, dict):
         print(f"{TAG_META} _get_workflow_data: metadata is empty or "
@@ -322,7 +296,6 @@ def _get_workflow_data(metadata):
 
     print(f"{TAG_META} _get_workflow_data: metadata keys = {list(metadata.keys())}")
 
-    # ── Pass 1: canonical key names ───────────────────────────────────────────
     for key in ("workflow", "Workflow", "prompt", "Prompt"):
         raw = metadata.get(key)
         if raw is None:
@@ -333,12 +306,10 @@ def _get_workflow_data(metadata):
             has_nodes_array = "nodes" in result
             has_numeric     = any(str(k).isdigit() for k in result)
             print(f"{TAG_META} _get_workflow_data: found via key={key!r}  "
-                  f"keys={node_count}  "
-                  f"has_nodes_array={has_nodes_array}  "
+                  f"keys={node_count}  has_nodes_array={has_nodes_array}  "
                   f"has_numeric_keys={has_numeric}")
             return result
 
-    # ── Pass 2: exhaustive scan of all string values ──────────────────────────
     print(f"{TAG_META} _get_workflow_data: canonical keys empty — scanning all values")
     for key, raw in metadata.items():
         if not isinstance(raw, str):
@@ -356,8 +327,7 @@ def _get_workflow_data(metadata):
         has_nodes_array = "nodes" in parsed
         if has_numeric or has_nodes_array:
             print(f"{TAG_META} _get_workflow_data: found via scan key={key!r}  "
-                  f"keys={len(parsed)}  "
-                  f"has_nodes_array={has_nodes_array}  "
+                  f"keys={len(parsed)}  has_nodes_array={has_nodes_array}  "
                   f"has_numeric_keys={has_numeric}")
             return parsed
 
@@ -367,24 +337,17 @@ def _get_workflow_data(metadata):
 
 def _normalise_metadata_pair(prompt_data, workflow_data):
     """
-    Ensure both halves of the (prompt_data, workflow_data) pair are either
-    plain Python dicts or None.
-
-    Handles:
-    • JSON strings  → parsed to dicts
-    • Wrapper dicts that contain *both* "prompt" and "workflow" sub-keys
-      (e.g. {"prompt": {...}, "workflow": {...}}) — unwrapped automatically
-    • Anything else → None
+    Ensure both halves of (prompt_data, workflow_data) are plain dicts or None.
+    Handles JSON strings, double-encoded strings, and wrapper dicts that contain
+    both "prompt" and "workflow" sub-keys.
     """
-    # ── Pass 1: coerce strings ────────────────────────────────────────────────
+    # Parse any raw JSON strings
     if isinstance(prompt_data, str):
         prompt_data = _coerce_to_dict(prompt_data, "prompt_data string")
     if isinstance(workflow_data, str):
         workflow_data = _coerce_to_dict(workflow_data, "workflow_data string")
 
-    # ── Pass 2: unwrap wrapper dicts ─────────────────────────────────────────
-    # A single dict like {"prompt": {...}, "workflow": {...}} may arrive on
-    # either side.  Detect and split it.
+    # Unwrap wrapper dicts like {"prompt": {...}, "workflow": {...}}
     for candidate, side in [(prompt_data, "prompt_data"),
                              (workflow_data, "workflow_data")]:
         if not isinstance(candidate, dict):
@@ -402,7 +365,7 @@ def _normalise_metadata_pair(prompt_data, workflow_data):
                                  else _coerce_to_dict(inner_w, "unwrapped workflow"))
             break
 
-    # ── Pass 3: final type gate ───────────────────────────────────────────────
+    # Final gate
     if not isinstance(prompt_data, dict):
         prompt_data = None
     if not isinstance(workflow_data, dict):
@@ -437,7 +400,7 @@ def extract_metadata_from_png(file_path):
             print(f"[PromptExtractor] Using cached PNG metadata for: {cache_key}")
 
             if isinstance(metadata, dict):
-                # ── A1111 / Forge parameters (JS pre-parsed) ──────────────────
+                # A1111 / Forge pre-parsed parameters
                 if metadata.get('parsed_parameters'):
                     print("[PromptExtractor] Found parsed A1111 parameters")
                     parsed = metadata['parsed_parameters']
@@ -449,31 +412,25 @@ def extract_metadata_from_png(file_path):
                                       'seed', 'width', 'height', 'modules'):
                                 if k in py_parsed and k not in parsed:
                                     parsed[k] = py_parsed[k]
-                    # workflow_data may still exist alongside A1111 params
                     raw_wf = metadata.get('workflow') or metadata.get('Workflow')
                     workflow_data = _coerce_to_dict(raw_wf, "cached workflow alongside A1111")
                     return parsed, workflow_data
 
-                # ── ComfyUI workflow / prompt ──────────────────────────────────
-                # Use _get_workflow_data so JSON-string values and non-standard
-                # key names are all handled in one place.
+                # ComfyUI workflow / prompt
+                # _get_workflow_data handles all key variants + JSON-string coercion.
                 workflow_data = _get_workflow_data(metadata)
+                raw_prompt    = metadata.get('prompt') or metadata.get('Prompt')
+                prompt_data   = (_coerce_to_dict(raw_prompt, "cached prompt")
+                                 if raw_prompt is not None else None)
 
-                # prompt_data is the execution graph ({node_id: {class_type, inputs}}).
-                raw_prompt = metadata.get('prompt') or metadata.get('Prompt')
-                prompt_data = (_coerce_to_dict(raw_prompt, "cached prompt")
-                               if raw_prompt is not None else None)
-
-                # If _get_workflow_data surfaced the execution graph (numeric keys,
+                # If _get_workflow_data returned an execution graph (numeric keys,
                 # no 'nodes' array) and prompt_data is still missing, promote it.
                 if (workflow_data is not None
                         and 'nodes' not in workflow_data
-                        and prompt_data is None):
-                    has_numeric = any(str(k).isdigit() for k in workflow_data)
-                    if has_numeric:
-                        print(f"{TAG_META} PNG cache: execution graph promoted "
-                              "to prompt_data")
-                        prompt_data, workflow_data = workflow_data, None
+                        and prompt_data is None
+                        and any(str(k).isdigit() for k in workflow_data)):
+                    print(f"{TAG_META} PNG cache: execution graph promoted to prompt_data")
+                    prompt_data, workflow_data = workflow_data, None
 
                 return prompt_data, workflow_data
 
@@ -484,11 +441,9 @@ def extract_metadata_from_png(file_path):
         print(f"[PromptExtractor] Falling back to PIL for: {file_path}")
         with Image.open(file_path) as img:
             metadata = img.info
-
-            # ── Debug: all metadata keys ──────────────────────────────────────
             print(f"[PromptExtractor] PNG metadata keys: {list(metadata.keys())}")
 
-            # ── A1111 / Forge parameters (plain text, not JSON) ───────────────
+            # A1111 / Forge: plain-text parameters chunk (not JSON)
             raw_params = (metadata.get('parameters') or metadata.get('Parameters')
                           or metadata.get('Comment') or metadata.get('comment'))
             if isinstance(raw_params, str) and (
@@ -501,15 +456,12 @@ def extract_metadata_from_png(file_path):
                     workflow_json = _get_workflow_data(dict(metadata))
                     return parsed, workflow_json
 
-            # ── ComfyUI workflow / prompt ──────────────────────────────────────
-            # _get_workflow_data handles all key variants and JSON coercion.
+            # ComfyUI workflow / prompt
             workflow_json = _get_workflow_data(dict(metadata))
+            raw_prompt    = metadata.get('prompt') or metadata.get('Prompt')
+            prompt_json   = (_coerce_to_dict(raw_prompt, "PIL prompt chunk")
+                             if raw_prompt else None)
 
-            raw_prompt = metadata.get('prompt') or metadata.get('Prompt')
-            prompt_json = (_coerce_to_dict(raw_prompt, "PIL prompt chunk")
-                           if raw_prompt else None)
-
-            # Debug
             print(f"[PromptExtractor] prompt_data found: {prompt_json is not None}, "
                   f"workflow_data found: {workflow_json is not None}")
             if prompt_json:
@@ -522,11 +474,10 @@ def extract_metadata_from_png(file_path):
             # Promote execution-graph when no separate prompt_json
             if (workflow_json is not None
                     and 'nodes' not in workflow_json
-                    and prompt_json is None):
-                has_numeric = any(str(k).isdigit() for k in workflow_json)
-                if has_numeric:
-                    print(f"{TAG_META} PIL: execution graph promoted to prompt_json")
-                    prompt_json, workflow_json = workflow_json, None
+                    and prompt_json is None
+                    and any(str(k).isdigit() for k in workflow_json)):
+                print(f"{TAG_META} PIL: execution graph promoted to prompt_json")
+                prompt_json, workflow_json = workflow_json, None
 
             return prompt_json, workflow_json
     except Exception as e:
@@ -556,22 +507,17 @@ def extract_metadata_from_jpeg(file_path):
             print(f"[PromptExtractor] Using cached JPEG/WebP metadata for: {cache_key}")
 
             if isinstance(metadata, dict):
-                # Use _get_workflow_data for consistent extraction regardless of
-                # which key names the cache used or whether values are strings.
                 workflow_data = _get_workflow_data(metadata)
-                raw_prompt = metadata.get('prompt') or metadata.get('Prompt')
-                prompt_data = (_coerce_to_dict(raw_prompt, "cached JPEG prompt")
-                               if raw_prompt is not None else None)
+                raw_prompt    = metadata.get('prompt') or metadata.get('Prompt')
+                prompt_data   = (_coerce_to_dict(raw_prompt, "cached JPEG prompt")
+                                 if raw_prompt is not None else None)
 
-                # Promote execution-graph when no separate prompt_data
                 if (workflow_data is not None
                         and 'nodes' not in workflow_data
-                        and prompt_data is None):
-                    has_numeric = any(str(k).isdigit() for k in workflow_data)
-                    if has_numeric:
-                        print(f"{TAG_META} JPEG cache: execution graph promoted "
-                              "to prompt_data")
-                        prompt_data, workflow_data = workflow_data, None
+                        and prompt_data is None
+                        and any(str(k).isdigit() for k in workflow_data)):
+                    print(f"{TAG_META} JPEG cache: execution graph promoted to prompt_data")
+                    prompt_data, workflow_data = workflow_data, None
 
                 return prompt_data, workflow_data
         else:
@@ -584,14 +530,11 @@ def extract_metadata_from_jpeg(file_path):
 
         print(f"[PromptExtractor] Falling back to PIL for: {file_path}")
         with Image.open(file_path) as img:
-            # Collect all EXIF / info fields into one flat dict so that
-            # _get_workflow_data can scan them in a single pass.
             combined_meta = {}
 
-            # ── EXIF tags ─────────────────────────────────────────────────────
             exif = img.getexif()
             if exif:
-                for tag_id in (0x010e, 0x010f):   # ImageDescription, Make
+                for tag_id in (0x010e, 0x010f):
                     tag_val = exif.get(tag_id)
                     if not tag_val:
                         continue
@@ -603,7 +546,6 @@ def extract_metadata_from_jpeg(file_path):
                     elif tag_val.startswith('Prompt:'):
                         combined_meta['prompt'] = tag_val[len('Prompt:'):].strip()
 
-                # UserComment (0x9286) — may be a wrapper {"prompt":…,"workflow":…}
                 user_comment = exif.get(0x9286)
                 if user_comment:
                     if isinstance(user_comment, bytes):
@@ -614,7 +556,6 @@ def extract_metadata_from_jpeg(file_path):
                     if isinstance(parsed_uc, dict):
                         combined_meta.update(parsed_uc)
 
-            # ── img.info text chunks ──────────────────────────────────────────
             if hasattr(img, 'info'):
                 for k, v in img.info.items():
                     if k not in combined_meta:
@@ -624,17 +565,16 @@ def extract_metadata_from_jpeg(file_path):
                   f"{list(combined_meta.keys())}")
 
             workflow_data = _get_workflow_data(combined_meta)
-            raw_prompt = combined_meta.get('prompt') or combined_meta.get('Prompt')
-            prompt_data = (_coerce_to_dict(raw_prompt, "JPEG prompt")
-                           if raw_prompt is not None else None)
+            raw_prompt    = combined_meta.get('prompt') or combined_meta.get('Prompt')
+            prompt_data   = (_coerce_to_dict(raw_prompt, "JPEG prompt")
+                             if raw_prompt is not None else None)
 
             if (workflow_data is not None
                     and 'nodes' not in workflow_data
-                    and prompt_data is None):
-                has_numeric = any(str(k).isdigit() for k in workflow_data)
-                if has_numeric:
-                    print(f"{TAG_META} JPEG PIL: execution graph promoted to prompt_data")
-                    prompt_data, workflow_data = workflow_data, None
+                    and prompt_data is None
+                    and any(str(k).isdigit() for k in workflow_data)):
+                print(f"{TAG_META} JPEG PIL: execution graph promoted to prompt_data")
+                prompt_data, workflow_data = workflow_data, None
 
             return prompt_data, workflow_data
     except Exception as e:
@@ -670,25 +610,20 @@ def extract_metadata_from_json(file_path):
         print(f"[PromptExtractor] JSON loaded, type: {type(data)}, "
               f"keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
 
-        # Normalise the loaded data — it may be a wrapper dict, an API-format
-        # execution graph, a workflow-format graph, or something else entirely.
         if isinstance(data, dict):
-            # ── Wrapper: {"prompt": ..., "workflow": ...} ─────────────────────
+            # Wrapper: {"prompt": {...}, "workflow": {...}}
             if 'prompt' in data or 'workflow' in data:
                 print("[PromptExtractor] JSON detected as wrapped format")
                 raw_p = data.get('prompt')
                 raw_w = data.get('workflow')
-                prompt_out  = _coerce_to_dict(raw_p, "JSON prompt key")  if raw_p is not None else None
-                workflow_out = _coerce_to_dict(raw_w, "JSON workflow key") if raw_w is not None else None
-                return prompt_out, workflow_out
-
-            # ── Workflow format: has 'nodes' array ────────────────────────────
+                return (_coerce_to_dict(raw_p, "JSON prompt key") if raw_p is not None else None,
+                        _coerce_to_dict(raw_w, "JSON workflow key") if raw_w is not None else None)
+            # Workflow format: has 'nodes' array
             if 'nodes' in data:
                 print(f"[PromptExtractor] JSON detected as workflow format with "
                       f"{len(data.get('nodes', []))} nodes")
                 return None, data
-
-            # ── API / execution-graph format: values are {class_type, inputs} ─
+            # API / execution-graph format: values are {class_type, inputs} dicts
             if any(isinstance(v, dict) and 'class_type' in v for v in data.values()):
                 print("[PromptExtractor] JSON detected as API/prompt format")
                 return data, None
@@ -1606,11 +1541,43 @@ _PROMPT_NODE_REGISTRY = {
     "easy showAnything":        ["text"],
 }
 
-# Sampler class types treated as anchor nodes
-_SAMPLER_CLASS_TYPES = {
+# ── Sampler anchor tiers ──────────────────────────────────────────────────────
+#
+# Tier 1 (highest priority): classic KSampler nodes — unambiguously samplers,
+#   always have direct positive/negative conditioning inputs.
+# Tier 2: advanced-pipeline sampler nodes — also true samplers but their
+#   positive/negative often arrive indirectly via Guider nodes.
+# Guiders (excluded from anchor detection): CFGGuider, BasicGuider, etc. have
+#   positive/negative inputs but are NOT samplers — they wrap conditioning and
+#   feed into SamplerCustomAdvanced.  Treating them as anchors causes the wrong
+#   (secondary) prompt chain to be selected.
+#
+# When both tiers are present, Tier-1 nodes take priority so that the primary
+# KSampler prompt is returned rather than a downstream editing pipeline prompt.
+
+_SAMPLER_TIER1 = {
+    # Classic — direct positive/negative conditioning, highest priority
     "KSampler", "KSamplerAdvanced",
     "WanVideoKSampler", "WanMoeKSamplerAdvanced",
-    "KSamplerSelect", "SamplerCustom", "SamplerCustomAdvanced",
+}
+
+_SAMPLER_TIER2 = {
+    # Advanced pipeline — true samplers but lower priority than classic
+    "SamplerCustom", "SamplerCustomAdvanced",
+}
+
+# KSamplerSelect has only sampler_name, no positive/negative — never an anchor
+_SAMPLER_CLASS_TYPES = _SAMPLER_TIER1 | _SAMPLER_TIER2   # kept for reference
+
+# Node class types that have positive/negative inputs but are NOT samplers.
+# These must be excluded from anchor detection entirely.
+_GUIDER_CLASS_TYPES = {
+    "CFGGuider", "BasicGuider", "DualCFGGuider",
+    "PerpNegGuider", "CFGGuiderSimple",
+    # Conditioning wrappers that forward conditioning but aren't samplers
+    "ConditioningCombine", "ConditioningConcat", "ConditioningSetArea",
+    "ConditioningSetMask", "ConditioningSetTimestepRange",
+    "ReferenceLatent",   # has conditioning input, definitely not a sampler
 }
 
 # Nodes whose outputs we should never mistake for a prompt
@@ -1632,21 +1599,59 @@ def _is_connection_ref(value):
 def _find_sampler_nodes_api(data):
     """
     Scan execution-graph dict for sampler anchor nodes.
-    Returns list of (node_id_str, node_dict) sorted so the LAST one wins
-    (matching the brief: "multiple samplers → pick LAST valid one").
+
+    Returns a list of (node_id_str, node_dict) in priority order:
+      • Tier-1 nodes (KSampler / KSamplerAdvanced variants) come first.
+      • Tier-2 nodes (SamplerCustom / SamplerCustomAdvanced) come second.
+      • Nodes that only have positive/negative via the heuristic check
+        (unknown class types) come last.
+
+    Within each tier, insertion order is preserved so that reversed()
+    on the final list still picks the last node of the highest tier —
+    matching the "multiple samplers → pick LAST valid one" requirement
+    while ensuring Tier-1 always beats Tier-2.
+
+    Nodes in _GUIDER_CLASS_TYPES are explicitly excluded even though
+    they carry positive/negative inputs — they are conditioning wrappers,
+    not samplers, and selecting them causes the wrong prompt chain to be
+    resolved (e.g. CFGGuider in an img2img edit pipeline).
     """
-    samplers = []
+    tier1 = []
+    tier2 = []
+    tier3 = []   # unknown class types that happen to have pos/neg inputs
+
     for nid, nd in data.items():
         if not isinstance(nd, dict):
             continue
-        ct = nd.get("class_type", "")
+        ct     = nd.get("class_type", "")
         inputs = nd.get("inputs", {})
-        # Match by class_type OR by having positive/negative inputs
-        if ct in _SAMPLER_CLASS_TYPES or (
-            "positive" in inputs or "negative" in inputs
-        ):
-            samplers.append((nid, nd))
-    return samplers
+
+        # Never use guiders / conditioning-wrappers as anchors
+        if ct in _GUIDER_CLASS_TYPES:
+            continue
+
+        has_pos_neg = ("positive" in inputs or "negative" in inputs)
+
+        if ct in _SAMPLER_TIER1:
+            tier1.append((nid, nd))
+        elif ct in _SAMPLER_TIER2:
+            tier2.append((nid, nd))
+        elif has_pos_neg:
+            # Unknown class type with positive/negative — include as low-priority
+            tier3.append((nid, nd))
+
+    # Tier-1 takes priority; only fall through to lower tiers when tier above is empty
+    if tier1:
+        print(f"{TAG} [graph-traversal] Sampler tiers: "
+              f"T1={len(tier1)} T2={len(tier2)} T3={len(tier3)} → using T1")
+        return tier1
+    if tier2:
+        print(f"{TAG} [graph-traversal] Sampler tiers: "
+              f"T1=0 T2={len(tier2)} T3={len(tier3)} → using T2")
+        return tier2
+    print(f"{TAG} [graph-traversal] Sampler tiers: "
+          f"T1=0 T2=0 T3={len(tier3)} → using T3 (unknown types)")
+    return tier3
 
 
 def _resolve_prompt_api(node_id_str, data, visited=None):
@@ -1781,32 +1786,49 @@ def _extract_prompts_via_graph_traversal(data):
 
     # Iterate samplers in REVERSE so we end up with the last valid one
     for sampler_id, sampler_node in reversed(samplers):
-        inputs = sampler_node.get("inputs", {})
+        inputs  = sampler_node.get("inputs", {})
+        ct      = sampler_node.get("class_type", "")
 
-        # ── Positive ─────────────────────────────────────────────────────────
-        if not positive_str:
-            pos_ref = inputs.get("positive")
-            if _is_connection_ref(pos_ref):
-                positive_str = _resolve_prompt_api(str(pos_ref[0]), data, set())
-                if positive_str:
-                    print(f"{TAG} [graph-traversal] Resolved positive prompt via sampler {sampler_id} "
-                          f"({len(positive_str)} chars)")
+        # ── Resolve positive/negative refs ────────────────────────────────────
+        # For KSampler-family nodes: positive/negative are direct conditioning refs.
+        # For SamplerCustomAdvanced: positive/negative are buried inside a Guider
+        # node referenced by the "guider" input.  Unwrap one level if needed.
+        pos_ref = inputs.get("positive")
+        neg_ref = inputs.get("negative")
 
-        # ── Negative ─────────────────────────────────────────────────────────
-        if not negative_str:
-            neg_ref = inputs.get("negative")
-            if _is_connection_ref(neg_ref):
-                negative_str = _resolve_prompt_api(str(neg_ref[0]), data, set())
-                if negative_str:
-                    print(f"{TAG} [graph-traversal] Resolved negative prompt via sampler {sampler_id} "
-                          f"({len(negative_str)} chars)")
+        if not _is_connection_ref(pos_ref) and not _is_connection_ref(neg_ref):
+            # No direct pos/neg — try following the guider input
+            guider_ref = inputs.get("guider")
+            if _is_connection_ref(guider_ref):
+                guider_node = data.get(str(guider_ref[0]), {})
+                guider_inputs = guider_node.get("inputs", {})
+                pos_ref = guider_inputs.get("positive") or pos_ref
+                neg_ref = guider_inputs.get("negative") or neg_ref
+                if _is_connection_ref(pos_ref) or _is_connection_ref(neg_ref):
+                    print(f"{TAG} [graph-traversal] Sampler {sampler_id} ({ct}): "
+                          f"resolved pos/neg via guider node {guider_ref[0]}")
+
+        # ── Positive ──────────────────────────────────────────────────────────
+        if not positive_str and _is_connection_ref(pos_ref):
+            positive_str = _resolve_prompt_api(str(pos_ref[0]), data, set())
+            if positive_str:
+                print(f"{TAG} [graph-traversal] Resolved positive via sampler "
+                      f"{sampler_id} ({len(positive_str)} chars)")
+
+        # ── Negative ──────────────────────────────────────────────────────────
+        if not negative_str and _is_connection_ref(neg_ref):
+            negative_str = _resolve_prompt_api(str(neg_ref[0]), data, set())
+            if negative_str:
+                print(f"{TAG} [graph-traversal] Resolved negative via sampler "
+                      f"{sampler_id} ({len(negative_str)} chars)")
 
         if positive_str and negative_str:
             break  # Both found — stop iterating
 
     # ── Fallback: heuristic scan ──────────────────────────────────────────────
     if not positive_str and not negative_str:
-        print(f"{TAG} [graph-traversal] No prompts via sampler anchors — running fallback scan")
+        print(f"{TAG} [graph-traversal] No prompts via sampler anchors — "
+              "running fallback scan")
         positive_str = _fallback_scan_api(data)
 
     return positive_str, negative_str
@@ -1836,27 +1858,25 @@ def parse_workflow_for_prompts(prompt_data, workflow_data=None):
     if not prompt_data and not workflow_data:
         return result
 
-    # ── Normalise inputs: ensure dicts, never raw JSON strings ───────────────
-    # This is the last-chance safety net: even if an extract_metadata_from_*
-    # function returned a string instead of a parsed dict, _normalise_metadata_pair
-    # will parse it here so the rest of the function always sees plain dicts.
+    # Last-chance normalisation: coerce JSON strings → dicts so all downstream
+    # code can rely on isinstance(x, dict) guards working correctly.
     prompt_data, workflow_data = _normalise_metadata_pair(prompt_data, workflow_data)
 
     if not prompt_data and not workflow_data:
-        print(f"{TAG_META} parse_workflow_for_prompts: both inputs are None "
-              "after normalisation — nothing to extract")
+        print(f"{TAG_META} parse_workflow_for_prompts: both inputs None after "
+              "normalisation — nothing to extract")
         return result
 
-    # ── Debug: report what we received after normalisation ───────────────────
+    # Debug: report what we received
     if workflow_data:
         wf_count        = len(workflow_data.get('nodes', workflow_data))
         has_nodes_array = 'nodes' in workflow_data
-        print(f"{TAG_META} parse_workflow_for_prompts: workflow_data present — "
+        print(f"{TAG_META} parse_workflow_for_prompts: workflow_data — "
               f"node/key count={wf_count}  has_nodes_array={has_nodes_array}")
     if prompt_data:
         pd_count    = len(prompt_data)
         has_numeric = any(str(k).isdigit() for k in prompt_data)
-        print(f"{TAG_META} parse_workflow_for_prompts: prompt_data present — "
+        print(f"{TAG_META} parse_workflow_for_prompts: prompt_data — "
               f"key count={pd_count}  has_numeric_keys={has_numeric}")
     if isinstance(prompt_data, dict) and 'prompt' in prompt_data and 'loras' in prompt_data:
         print("[PromptExtractor] Processing A1111 parsed parameters")
@@ -2664,39 +2684,31 @@ def parse_workflow_for_prompts(prompt_data, workflow_data=None):
     # ========================================
     # GRAPH-TRAVERSAL PASS (API / prompt-dict format)
     # ========================================
-    # Run the sampler-anchored recursive traversal whenever we have an
-    # API-format execution graph (data), regardless of whether the
-    # standard loop above already found prompts.
+    # Always run when we have an API-format execution graph (data).
     #
-    # Rationale: the standard loop cannot determine positive vs negative
-    # direction without workflow_data / node_map (which require the
-    # human-facing "workflow" chunk, not just the "prompt" chunk).
-    # Without direction data it puts *all* CLIPTextEncode nodes into
-    # positive_prompts.  The sampler-anchored traversal below always
-    # resolves direction correctly by following positive/negative inputs
-    # from the KSampler anchor.
+    # The standard loop above cannot determine positive vs negative direction
+    # without workflow_data / node_map.  Without direction info it puts ALL
+    # CLIPTextEncode nodes into positive_prompts.  The sampler-anchored
+    # traversal below resolves direction correctly by following
+    # positive/negative inputs from the KSampler anchor node.
     #
     # Strategy:
-    #   1. Always run traversal when data is present.
-    #   2. If traversal found prompts → use them (they have correct direction).
-    #   3. If traversal found nothing → keep whatever the standard loop found.
+    #   • If traversal finds prompts → REPLACE loop results (direction is correct)
+    #   • If traversal finds nothing → keep whatever the standard loop found
     if data:
         try:
             gt_pos, gt_neg = _extract_prompts_via_graph_traversal(data)
             if gt_pos or gt_neg:
-                # Traversal succeeded with correct direction — override loop results
                 if gt_pos:
-                    print(f"{TAG} [graph-traversal] Using traversal positive "
-                          f"({len(gt_pos)} chars)")
+                    print(f"{TAG} [graph-traversal] Replacing positive with "
+                          f"traversal result ({len(gt_pos)} chars)")
                     positive_prompts = [gt_pos]
                 if gt_neg:
-                    print(f"{TAG} [graph-traversal] Using traversal negative "
-                          f"({len(gt_neg)} chars)")
+                    print(f"{TAG} [graph-traversal] Replacing negative with "
+                          f"traversal result ({len(gt_neg)} chars)")
                     negative_prompts = [gt_neg]
             else:
-                # Traversal found nothing — keep standard loop results as-is
-                print(f"{TAG} [graph-traversal] No result from traversal; "
-                      "keeping standard-loop prompts")
+                print(f"{TAG} [graph-traversal] No result — keeping standard-loop prompts")
         except Exception as _gt_err:
             print(f"{TAG} [graph-traversal] Error (non-fatal): {_gt_err}")
 

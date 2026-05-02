@@ -17,6 +17,17 @@ The **Meta Prompt Extractor** reads hidden metadata embedded in image files and 
 - **Positive prompts** — The main text description used to generate an image
 - **Negative prompts** — Text describing what to avoid in generation
 
+## How the Prompt Is Found
+
+Most tools just look for a `CLIPTextEncode` node and read its text field. That works for simple workflows but fails the moment a custom node, a chained text node, or a multi-stage pipeline is involved.
+
+This node works differently:
+
+1. **Finds the sampler first** — `KSampler`, `SamplerCustomAdvanced`, etc. — and uses it as the anchor point, because the sampler always knows what its positive and negative conditioning are
+2. **Follows connections backwards** from the sampler's inputs, traversing through however many intermediate nodes there are, until it reaches the actual text
+3. **Checks a registry of known custom nodes** so it knows exactly which field holds the text in nodes like `PromptManager` or `Prompt Verify`
+4. **Falls back to a smart scan** if the chain leads somewhere unexpected — scanning all string values in the workflow and returning the most natural-language-looking result
+
 ## Installation
 
 1. **Download the folder** into your ComfyUI `custom_nodes` directory:
