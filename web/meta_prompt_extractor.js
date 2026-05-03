@@ -36,8 +36,7 @@ function buildFileUrl(filename, viewType) {
 }
 
 function _fileIcon(ext) {
-    const map = { '.png':'🖼','.jpg':'🖼','.jpeg':'🖼','.webp':'🖼',
-                  '.mp4':'🎬','.webm':'🎬','.mov':'🎬','.avi':'🎬','.json':'📄' };
+    const map = { '.png':'🖼','.jpg':'🖼','.jpeg':'🖼','.webp':'🖼','.json':'📄' };
     return map[(ext||'').toLowerCase()] || '📄';
 }
 
@@ -413,42 +412,24 @@ async function createFileBrowserModal(currentFile, onSelect) {
     filterButtonsContainer.style.cssText = 'display:flex;align-items:center;gap:4px;padding:0 8px;border-left:1px solid #2e3d4e;flex-shrink:0;';
     
     let activeFilters = {
-        imagesOnly: false,
-        hasMetadata: false,
-        recent: false
+        hasMetadata: false
     };
     
     const filterButtonStyle = (active) => 
         `background:${active?'#3a6a80':'#253040'};border:1px solid ${active?'#4a8aaa':'#3a4a5a'};border-radius:5px;color:${active?'#a8dff0':'#9ab8d0'};padding:5px 10px;font-size:11px;cursor:pointer;white-space:nowrap;transition:all 0.15s;`;
-    
-    const imgFilterBtn = document.createElement('button');
-    imgFilterBtn.textContent = '🖼 Images';
-    imgFilterBtn.title = 'Show images only';
-    imgFilterBtn.style.cssText = filterButtonStyle(false);
     
     const metaFilterBtn = document.createElement('button');
     metaFilterBtn.textContent = '📋 Metadata';
     metaFilterBtn.title = 'Show files with metadata only';
     metaFilterBtn.style.cssText = filterButtonStyle(false);
     
-    const recentFilterBtn = document.createElement('button');
-    recentFilterBtn.textContent = '🕐 Recent';
-    recentFilterBtn.title = 'Show recent files (24h)';
-    recentFilterBtn.style.cssText = filterButtonStyle(false);
-    
     const updateFilterButtonStyle = () => {
-        imgFilterBtn.style.cssText = filterButtonStyle(activeFilters.imagesOnly);
         metaFilterBtn.style.cssText = filterButtonStyle(activeFilters.hasMetadata);
-        recentFilterBtn.style.cssText = filterButtonStyle(activeFilters.recent);
     };
     
-    imgFilterBtn.onclick = () => { activeFilters.imagesOnly = !activeFilters.imagesOnly; updateFilterButtonStyle(); if (currentBrowseData) renderDir(currentBrowseData); };
     metaFilterBtn.onclick = () => { activeFilters.hasMetadata = !activeFilters.hasMetadata; updateFilterButtonStyle(); if (currentBrowseData) renderDir(currentBrowseData); };
-    recentFilterBtn.onclick = () => { activeFilters.recent = !activeFilters.recent; updateFilterButtonStyle(); if (currentBrowseData) renderDir(currentBrowseData); };
     
-    filterButtonsContainer.appendChild(imgFilterBtn);
     filterButtonsContainer.appendChild(metaFilterBtn);
-    filterButtonsContainer.appendChild(recentFilterBtn);
     pathBar.appendChild(filterButtonsContainer);
 
     // ─── Sort dropdown ───
@@ -933,14 +914,6 @@ async function createFileBrowserModal(currentFile, onSelect) {
         // Parse filter query
         const filterTerms = parseFilterQuery(currentFilter);
         
-        // Helper: check if file is recent (24 hours)
-        const isRecentFile = (mtime) => {
-            const now = Date.now();
-            const fileTime = (mtime || 0) * 1000; // Convert to ms
-            const ageMs = now - fileTime;
-            return ageMs < (24 * 60 * 60 * 1000); // 24 hours
-        };
-        
         // Separate images from other files
         const imageExts = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'];
         const imageFiles = data.entries.filter(e => {
@@ -962,7 +935,6 @@ async function createFileBrowserModal(currentFile, onSelect) {
         let filteredImageFiles = imageFiles.filter(e => {
             if (!matchesFilter(e, filterTerms)) return false;
             if (activeFilters.hasMetadata && !e.has_metadata) return false;
-            if (activeFilters.recent && !isRecentFile(e.mtime)) return false;
             return true;
         });
         
@@ -970,16 +942,9 @@ async function createFileBrowserModal(currentFile, onSelect) {
         let filteredOtherFiles = otherFiles.filter(e => {
             if (e.type === 'dir') return true; // Always show directories for navigation
             if (!matchesFilter(e, filterTerms)) return false;
-            if (activeFilters.imagesOnly) return false; // Hide non-images when images-only filter active
             if (activeFilters.hasMetadata && !e.has_metadata) return false;
-            if (activeFilters.recent && !isRecentFile(e.mtime)) return false;
             return true;
         });
-        
-        // If images-only filter is active, hide non-image files (but keep directories)
-        if (activeFilters.imagesOnly) {
-            filteredOtherFiles = filteredOtherFiles.filter(e => e.type === 'dir');
-        }
         
         // Update filter results label
         if (filterTerms.length > 0) {
@@ -1391,10 +1356,6 @@ async function createFileBrowserModal(currentFile, onSelect) {
     }
 }
 // ─────────────────────────────────────────────────────────────────────────────
-const PLACEHOLDER_IMAGE_PATH = new URL("./placeholder.png", import.meta.url).href;
-
-// Track videos that the browser cannot decode (H265/yuv444) - skip browser attempts on scrub
-const _nonBrowserDecodableVideos = new Set();
 
 /**
  * Extract metadata from PNG file
@@ -1505,15 +1466,14 @@ async function getPNGMetadata(file) {
 
 /**
  * Parse A1111/Forge parameters format
- * Extracts prompt, negative, and LoRAs
+ * Extracts prompt and negative prompt (strips LoRA tags)
  */
 function parseA1111Parameters(parametersText) {
     if (!parametersText) return null;
 
     const result = {
         prompt: '',
-        negative_prompt: '',
-        loras: []
+        negative_prompt: ''
     };
 
     // Split by "Negative prompt:" to separate positive and negative
@@ -1521,27 +1481,10 @@ function parseA1111Parameters(parametersText) {
     let positivePrompt = parts[0].trim();
     let remainder = parts[1] || '';
 
-    // Extract LoRAs from positive prompt using pattern: <lora:name:strength> or <lora:name:model_strength:clip_strength>
-    const loraRegex = /<lora:([^:>]+):([^:>]+)(?::([^:>]+))?>/gi;
-    let loraMatch;
-    const loras = [];
-    
-    while ((loraMatch = loraRegex.exec(positivePrompt)) !== null) {
-        const loraName = loraMatch[1].trim();
-        const strength1 = parseFloat(loraMatch[2]);
-        const strength2 = loraMatch[3] ? parseFloat(loraMatch[3]) : strength1;
-        
-        loras.push({
-            name: loraName,
-            model_strength: strength1,
-            clip_strength: strength2
-        });
-    }
-
     // Remove LoRA tags from prompt
+    const loraRegex = /<lora:([^:>]+):([^:>]+)(?::([^:>]+))?>/gi;
     positivePrompt = positivePrompt.replace(loraRegex, '').trim();
     result.prompt = positivePrompt;
-    result.loras = loras;
 
     // Extract negative prompt (before any "Steps:" line if present)
     const settingsMatch = remainder.match(/^(.*?)[\r\n]+Steps:/s);
@@ -1551,314 +1494,7 @@ function parseA1111Parameters(parametersText) {
         result.negative_prompt = remainder.trim();
     }
 
-    // Extract model name from settings line (e.g. "Model: modelName")
-    const modelMatch = parametersText.match(/\bModel:\s*([^,\n]+)/);
-    if (modelMatch) {
-        result.model = modelMatch[1].trim();
-    }
-
     return result;
-}
-
-function _isLoraAvailableForSort(lora) {
-    if (!lora) return true;
-    if (lora.available === false) return false;
-    if (lora.found === false) return false;
-    return true;
-}
-
-function _sortLorasMissingLast(loras) {
-    const src = Array.isArray(loras) ? [...loras] : [];
-    return src.sort((a, b) => {
-        const aAvailable = _isLoraAvailableForSort(a);
-        const bAvailable = _isLoraAvailableForSort(b);
-        if (aAvailable !== bAvailable) return aAvailable ? -1 : 1;
-        return String(a?.name || "").localeCompare(String(b?.name || ""));
-    });
-}
-
-function _normalizeExtractedLoraOrder(extracted) {
-    if (!extracted || typeof extracted !== "object") return extracted;
-    const normalized = { ...extracted };
-    if (Array.isArray(normalized.loras)) {
-        normalized.loras = _sortLorasMissingLast(normalized.loras);
-    }
-    if (Array.isArray(normalized.loras_a)) {
-        normalized.loras_a = _sortLorasMissingLast(normalized.loras_a);
-    }
-    if (Array.isArray(normalized.loras_b)) {
-        normalized.loras_b = _sortLorasMissingLast(normalized.loras_b);
-    }
-    return normalized;
-}
-
-function _extractorParseJsonObjectSafe(rawValue, fallback = null) {
-    if (rawValue && typeof rawValue === "object") return rawValue;
-    if (typeof rawValue !== "string") return fallback;
-    const trimmed = rawValue.trim();
-    if (!trimmed) return fallback;
-    try {
-        const parsed = JSON.parse(trimmed);
-        return parsed && typeof parsed === "object" ? parsed : fallback;
-    } catch {
-        return fallback;
-    }
-}
-
-function _extractorModelNameForSummary(pathLike) {
-    const raw = String(pathLike || "").trim();
-    if (!raw) return "";
-    const parts = raw.replace(/\\/g, "/").split("/");
-    const base = parts[parts.length - 1] || raw;
-    return base.replace(/\.(safetensors|ckpt|pt|pth|bin|gguf|sft)$/i, "");
-}
-
-function _extractorNormalizeSummaryLoras(list) {
-    if (!Array.isArray(list)) return [];
-    return list
-        .map((item) => {
-            if (!item || typeof item !== "object") return null;
-            const name = String(item.name || "").trim();
-            if (!name) return null;
-            const strengthRaw = Number(item.model_strength ?? item.strength ?? 1.0);
-            const strength = Number.isFinite(strengthRaw) ? strengthRaw : 1.0;
-            const available = item.available !== false && item.found !== false;
-            return {
-                name,
-                strength,
-                active: item.active !== false,
-                available,
-                found: item.found !== false,
-            };
-        })
-        .filter(Boolean)
-        .sort((a, b) => String(a.name).localeCompare(String(b.name)));
-}
-
-function _extractorSummarizeWorkflowDataDiscovery(rawWorkflowData) {
-    const empty = {
-        modelCount: 0,
-        modelDetails: [],
-        source: "RecipeExtractor",
-    };
-
-    const wf = _extractorParseJsonObjectSafe(rawWorkflowData, null);
-    if (!wf || typeof wf !== "object") return empty;
-
-    const slotOrder = ["model_a", "model_b", "model_c", "model_d"];
-    const modelDetails = [];
-    const models = (wf.models && typeof wf.models === "object") ? wf.models : null;
-
-    if (models) {
-        for (const slot of slotOrder) {
-            const block = models[slot];
-            if (!block || typeof block !== "object") continue;
-            const modelName = String(block.model || "").trim();
-            const loras = _extractorNormalizeSummaryLoras(block.loras);
-            if (!modelName && loras.length === 0) continue;
-            modelDetails.push({
-                slotLabel: String(slot).replace("model_", "").toUpperCase(),
-                modelDisplay: _extractorModelNameForSummary(modelName),
-                family: String(block.family || "").trim(),
-                loras,
-            });
-        }
-    } else {
-        const modelA = String(wf.model_a || "").trim();
-        const modelB = String(wf.model_b || "").trim();
-        const lorasA = _extractorNormalizeSummaryLoras(wf.loras_a);
-        const lorasB = _extractorNormalizeSummaryLoras(wf.loras_b);
-
-        if (modelA || lorasA.length > 0) {
-            modelDetails.push({
-                slotLabel: "A",
-                modelDisplay: _extractorModelNameForSummary(modelA),
-                family: "",
-                loras: lorasA,
-            });
-        }
-        if (modelB || lorasB.length > 0) {
-            modelDetails.push({
-                slotLabel: "B",
-                modelDisplay: _extractorModelNameForSummary(modelB),
-                family: "",
-                loras: lorasB,
-            });
-        }
-    }
-
-    return {
-        modelCount: modelDetails.length,
-        modelDetails,
-        source: String(wf._source || "RecipeExtractor"),
-    };
-}
-
-function _createExtractorSummaryLoraTag(lora) {
-    const tag = document.createElement("div");
-    const isAvailable = lora?.available !== false && lora?.found !== false;
-    const strength = Number(lora?.strength ?? 1.0);
-
-    tag.style.cssText = `
-        display:inline-flex;
-        align-items:center;
-        gap:6px;
-        width:200px;
-        height:24px;
-        padding:4px 10px;
-        box-sizing:border-box;
-        border-radius:6px;
-        border:1px solid ${isAvailable ? "rgba(71,145,220,0.85)" : "rgba(220,53,69,0.9)"};
-        background:${isAvailable ? "rgba(61,134,210,0.9)" : "rgba(220,53,69,0.9)"};
-        color:#fff;
-        flex-shrink:0;
-        font-size:12px;
-    `;
-
-    const nameSpan = document.createElement("span");
-    nameSpan.textContent = String(lora?.name || "");
-    nameSpan.style.cssText = "flex-grow:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;";
-    tag.appendChild(nameSpan);
-
-    const strengthBadge = document.createElement("span");
-    strengthBadge.textContent = Number.isFinite(strength) ? strength.toFixed(2) : "1.00";
-    strengthBadge.style.cssText = "font-size:10px; font-weight:600; padding:1px 6px; border-radius:999px; background:rgba(255,255,255,0.15);";
-    tag.appendChild(strengthBadge);
-
-    return tag;
-}
-
-function _showExtractorWorkflowSummaryDialog(summary) {
-    return new Promise((resolve) => {
-        const overlay = document.createElement("div");
-        overlay.style.cssText = "position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:9999;";
-
-        const dialog = document.createElement("div");
-        dialog.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); width:min(452px, 92vw); max-height:78vh; overflow:auto; background:#232930; border:1px solid #3c4b59; border-radius:10px; padding:12px; z-index:10000; box-shadow:0 8px 28px rgba(0,0,0,0.55);";
-
-        const title = document.createElement("div");
-        title.textContent = "Summary";
-        title.style.cssText = "margin-bottom:8px; font-size:17px; font-weight:700; color:#e7eef6;";
-        dialog.appendChild(title);
-
-        const meta = document.createElement("div");
-        meta.style.cssText = "margin-bottom:12px; color:#9eb2c6; font-size:12px; padding-bottom:10px; border-bottom:1px solid rgba(115,144,170,0.35);";
-        meta.innerHTML = `<b style=\"color:#c5d8ea;\">Models found:</b> ${summary.modelCount}`;
-        dialog.appendChild(meta);
-
-        const modelsSection = document.createElement("div");
-        modelsSection.style.cssText = "margin-bottom:14px;";
-        modelsSection.innerHTML = `<div style=\"color:#8fb8dc; font-weight:700; margin-bottom:6px;\">Models</div>`;
-        const modelsList = document.createElement("div");
-        modelsList.style.cssText = "display:flex; flex-direction:column; gap:6px;";
-        if (!summary.modelDetails.length) {
-            const none = document.createElement("div");
-            none.textContent = "No models found.";
-            none.style.cssText = "color:#9aa8b7; font-size:12px;";
-            modelsList.appendChild(none);
-        } else {
-            for (const item of summary.modelDetails) {
-                const row = document.createElement("div");
-                const familyText = item.family ? ` (${item.family})` : "";
-                row.textContent = `${item.slotLabel}: ${item.modelDisplay || "(none)"}${familyText}`;
-                row.style.cssText = "color:#d9e6f3; font-size:13px; background:rgba(37,48,60,0.55); border:1px solid rgba(96,124,150,0.35); border-radius:6px; padding:6px 8px;";
-                modelsList.appendChild(row);
-            }
-        }
-        modelsSection.appendChild(modelsList);
-        dialog.appendChild(modelsSection);
-
-        const loraDivider = document.createElement("div");
-        loraDivider.style.cssText = "height:1px; background:rgba(115,144,170,0.35); margin:2px 0 12px 0;";
-        dialog.appendChild(loraDivider);
-
-        const loraSection = document.createElement("div");
-        loraSection.innerHTML = `<div style=\"color:#8fb8dc; font-weight:700; margin-bottom:8px;\">LoRAs</div>`;
-        if (!summary.modelDetails.some((m) => Array.isArray(m.loras) && m.loras.length > 0)) {
-            const none = document.createElement("div");
-            none.textContent = "No LoRAs found.";
-            none.style.cssText = "color:#9aa8b7; font-size:12px; margin-bottom:8px;";
-            loraSection.appendChild(none);
-        } else {
-            for (const item of summary.modelDetails) {
-                if (!Array.isArray(item.loras) || item.loras.length === 0) continue;
-                const stackCard = document.createElement("div");
-                stackCard.style.cssText = "background:rgba(30,40,52,0.55); border:1px solid rgba(96,124,150,0.35); border-radius:8px; padding:6px; margin-bottom:6px;";
-
-                const stackTitle = document.createElement("div");
-                stackTitle.textContent = `Stack ${item.slotLabel}:`;
-                stackTitle.style.cssText = "color:#c5d8ea; font-size:12px; margin:0 0 6px 0;";
-                stackCard.appendChild(stackTitle);
-
-                const stackTags = document.createElement("div");
-                stackTags.style.cssText = "display:grid; grid-template-columns: 200px 200px; justify-content:start; gap:2px;";
-                for (const lora of item.loras) {
-                    stackTags.appendChild(_createExtractorSummaryLoraTag(lora));
-                }
-                stackCard.appendChild(stackTags);
-                loraSection.appendChild(stackCard);
-            }
-        }
-        dialog.appendChild(loraSection);
-
-        const actions = document.createElement("div");
-        actions.style.cssText = "display:flex; justify-content:flex-end; margin-top:14px;";
-        const okBtn = document.createElement("button");
-        okBtn.textContent = "OK";
-        okBtn.style.cssText = "padding:8px 16px; background:#2f7dbf; color:#fff; border:none; border-radius:6px; cursor:pointer;";
-        actions.appendChild(okBtn);
-        dialog.appendChild(actions);
-
-        const cleanup = () => {
-            if (overlay.parentNode) document.body.removeChild(overlay);
-            if (dialog.parentNode) document.body.removeChild(dialog);
-        };
-
-        okBtn.onclick = () => { cleanup(); resolve(true); };
-        overlay.onclick = () => { cleanup(); resolve(true); };
-
-        document.body.appendChild(overlay);
-        document.body.appendChild(dialog);
-        okBtn.focus();
-    });
-}
-
-async function showExtractorWorkflowDiscoverySummary(node) {
-    const rawCached = node?.properties?.pe_extracted_data;
-    let workflowData = _extractorParseJsonObjectSafe(rawCached, null);
-
-    if (!workflowData) {
-        const imageWidget = node?.widgets?.find((w) => w.name === "image");
-        const filename = String(imageWidget?.value || "").trim();
-        const sourceFolder = node?._sourceFolder || "input";
-        if (filename && filename !== "(none)") {
-            try {
-                const _isAbsP = typeof isAbsolutePath === 'function' && isAbsolutePath(filename);
-                const _prevUrl = _isAbsP
-                    ? `/meta-prompt-extractor/extract-preview-abs?path=${encodeURIComponent(filename)}`
-                    : `/meta-prompt-extractor/extract-preview?filename=${encodeURIComponent(filename)}&source=${encodeURIComponent(sourceFolder)}`;
-                const previewResp = await fetch(_prevUrl);
-                if (previewResp.ok) {
-                    const previewData = await previewResp.json();
-                    if (previewData?.extracted && typeof previewData.extracted === "object") {
-                        workflowData = _normalizeExtractedLoraOrder(previewData.extracted);
-                        node.properties = node.properties || {};
-                        node.properties.pe_extracted_data = JSON.stringify(workflowData);
-                    }
-                }
-            } catch (error) {
-                console.warn('[MetaPromptExtractor] Could not refresh extracted preview data:', error);
-            }
-        }
-    }
-
-    if (!workflowData || typeof workflowData !== "object") {
-        await _showExtractorWorkflowSummaryDialog({ modelCount: 0, modelDetails: [], source: "RecipeExtractor" });
-        return;
-    }
-
-    const summary = _extractorSummarizeWorkflowDataDiscovery(workflowData);
-    await _showExtractorWorkflowSummaryDialog(summary);
 }
 
 /**
@@ -2058,125 +1694,6 @@ async function getWebPMetadata(file) {
 }
 
 /**
- * Extract metadata from JSON file
- */
-async function getJSONMetadata(file) {
-    return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onload = (event) => {
-            try {
-                const json = JSON.parse(event.target.result);
-                resolve(json);
-            } catch (e) {
-                console.error('[MetaPromptExtractor] Failed to parse JSON file:', e);
-                resolve(null);
-            }
-        };
-        reader.readAsText(file);
-    });
-}
-
-/**
- * Extract metadata from video file (WebM/MKV/MP4)
- * Reads container metadata directly
- */
-async function getVideoMetadata(file) {
-    return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onload = (event) => {
-            const videoData = new Uint8Array(event.target.result);
-            const dataView = new DataView(videoData.buffer);
-            const decoder = new TextDecoder();
-
-            // Check for WebM/MKV (EBML/Matroska format) - magic: 0x1A45DFA3
-            if (dataView.getUint32(0) === 0x1A45DFA3) {
-                // Look for COMMENT tag (0x4487) which contains workflow metadata
-                let offset = 4 + 8;
-                while (offset < videoData.length - 16) {
-                    if (dataView.getUint16(offset) === 0x4487) {
-                        const name = String.fromCharCode(...videoData.slice(offset - 7, offset));
-                        if (name === "COMMENT") {
-                            let vint = dataView.getUint32(offset + 2);
-                            let n_octets = Math.clz32(vint) + 1;
-                            if (n_octets < 4) {
-                                let length = (vint >> (8 * (4 - n_octets))) & ~(1 << (7 * n_octets));
-                                const content = decoder.decode(videoData.slice(offset + 2 + n_octets, offset + 2 + n_octets + length));
-                                try {
-                                    const json = JSON.parse(content);
-                                    resolve(json);
-                                    return;
-                                } catch (e) {
-                                    console.error("[MetaPromptExtractor] Failed to parse WebM/MKV metadata:", e);
-                                }
-                            }
-                        }
-                    }
-                    offset += 1;
-                }
-            }
-            // Check for MP4 (ISO Media format) - ftyp: 0x66747970, isom: 0x69736F6D
-            else if (dataView.getUint32(4) === 0x66747970 && dataView.getUint32(8) === 0x69736F6D) {
-                // Look for 'cmt' (comment) data tag in MP4
-                let offset = videoData.length - 4;
-                while (offset > 16) {
-                    if (dataView.getUint32(offset) === 0x64617461) { // 'data' tag
-                        if (dataView.getUint32(offset - 8) === 0xa9636d74) { // 'cmt' tag
-                            let size = dataView.getUint32(offset - 4) - 4 * 4;
-                            const content = decoder.decode(videoData.slice(offset + 12, offset + 12 + size));
-                            try {
-                                const json = JSON.parse(content);
-                                resolve(json);
-                                return;
-                            } catch (e) {
-                                console.error("[MetaPromptExtractor] Failed to parse MP4 metadata:", e);
-                            }
-                        }
-                    }
-                    offset -= 1;
-                }
-            }
-
-            resolve(null);
-        };
-        reader.readAsArrayBuffer(file);
-    });
-}
-
-/**
- * Request Python to extract video metadata using ffprobe (fallback)
- */
-async function extractVideoMetadataWithPython(filename, source = 'input') {
-    try {
-        console.log(`[MetaPromptExtractor] Requesting Python ffprobe extraction for: ${filename}`);
-        const response = await api.fetchApi("/meta-prompt-extractor/extract-video-metadata", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ filename, source })
-        });
-
-        if (response.ok) {
-            const result = await response.json();
-            if (result.success && result.metadata) {
-                console.log(`[MetaPromptExtractor] Python extracted video metadata successfully for: ${filename}`);
-                console.log(`[MetaPromptExtractor] Metadata:`, result.metadata);
-                return result.metadata;
-            } else if (result.warning && result.error === 'ffprobe_not_found') {
-                console.warn(`[MetaPromptExtractor] WARNING: Video metadata fallback unavailable - ffprobe not found.`);
-                console.warn(`[MetaPromptExtractor] Install FFmpeg to enable metadata extraction for all video formats.`);
-            } else {
-                console.log(`[MetaPromptExtractor] Python extraction returned no metadata for: ${filename}`);
-            }
-        } else {
-            console.error(`[MetaPromptExtractor] Python extraction failed with status: ${response.status}`);
-        }
-        return null;
-    } catch (error) {
-        console.error("[MetaPromptExtractor] Error requesting Python video extraction:", error);
-        return null;
-    }
-}
-
-/**
  * Send file metadata to Python backend for caching
  */
 async function cacheFileMetadata(filename, metadata) {
@@ -2194,27 +1711,6 @@ async function cacheFileMetadata(filename, metadata) {
         }
     } catch (error) {
         console.error("[MetaPromptExtractor] Error caching metadata:", error);
-    }
-}
-
-/**
- * Send video frame to Python backend for caching
- */
-async function cacheVideoFrame(filename, frameData, framePosition) {
-    try {
-        const response = await api.fetchApi("/meta-prompt-extractor/cache-video-frame", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ filename, frame: frameData, frame_position: framePosition })
-        });
-
-        if (response.ok) {
-            console.log(`[MetaPromptExtractor] Cached video frame at position ${framePosition.toFixed(2)} for: ${filename}`);
-        } else {
-            console.error("[MetaPromptExtractor] Failed to cache video frame:", response.status);
-        }
-    } catch (error) {
-        console.error("[MetaPromptExtractor] Error caching video frame:", error);
     }
 }
 
@@ -2371,205 +1867,13 @@ function showImagePreviewModal(filename, viewType) {
 }
 
 /**
- * Create and show video preview modal
- */
-function showVideoPreviewModal(filename, viewType) {
-    // Build video URL
-    let actualFilename = filename;
-    let subfolder = "";
-    
-    if (filename.includes('/')) {
-        const lastSlash = filename.lastIndexOf('/');
-        subfolder = filename.substring(0, lastSlash);
-        actualFilename = filename.substring(lastSlash + 1);
-    }
-    
-    let videoUrl = `/view?filename=${encodeURIComponent(actualFilename)}&type=${viewType || 'input'}`;
-    if (subfolder) {
-        videoUrl += `&subfolder=${encodeURIComponent(subfolder)}`;
-    }
-
-    // Create modal overlay
-    const overlay = document.createElement('div');
-    overlay.style.cssText = `
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        background: rgba(0, 0, 0, 0.85);
-        z-index: 10000;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-    `;
-
-    // Create header with filename and close button
-    const header = document.createElement('div');
-    header.style.cssText = `
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        padding: 15px 20px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        background: rgba(0, 0, 0, 0.5);
-    `;
-
-    const title = document.createElement('span');
-    title.textContent = filename;
-    title.style.cssText = `
-        color: #fff;
-        font-size: 14px;
-        font-family: sans-serif;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        max-width: calc(100% - 50px);
-    `;
-
-    const closeBtn = document.createElement('button');
-    closeBtn.textContent = '?';
-    closeBtn.style.cssText = `
-        background: rgba(255, 255, 255, 0.1);
-        border: none;
-        color: #fff;
-        font-size: 20px;
-        width: 36px;
-        height: 36px;
-        border-radius: 50%;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        transition: background 0.2s;
-    `;
-    closeBtn.onmouseover = () => closeBtn.style.background = 'rgba(255, 255, 255, 0.2)';
-    closeBtn.onmouseout = () => closeBtn.style.background = 'rgba(255, 255, 255, 0.1)';
-    closeBtn.onclick = () => overlay.remove();
-
-    header.appendChild(title);
-    header.appendChild(closeBtn);
-
-    // Create video container
-    const videoContainer = document.createElement('div');
-    videoContainer.style.cssText = `
-        max-width: 90%;
-        max-height: 80%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    `;
-
-    // Create video element
-    const video = document.createElement('video');
-    video.src = videoUrl;
-    video.controls = true;
-    video.autoplay = true;
-    video.loop = true;
-    video.style.cssText = `
-        max-width: 100%;
-        max-height: 80vh;
-        border-radius: 8px;
-        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
-    `;
-
-    // Error handling - browser can't decode (H265/yuv444)
-    video.onerror = () => {
-        // Fall back to server-extracted frame with overlay
-        const frameUrl = `/meta-prompt-extractor/video-frame?filename=${encodeURIComponent(filename)}&source=${viewType || 'input'}&position=0`;
-        const fallbackImg = document.createElement('img');
-        fallbackImg.style.cssText = `
-            max-width: 100%; max-height: 80vh; border-radius: 8px;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
-        `;
-        fallbackImg.onload = () => {
-            videoContainer.innerHTML = '';
-            videoContainer.style.position = 'relative';
-            videoContainer.appendChild(fallbackImg);
-            const msgOverlay = document.createElement('div');
-            msgOverlay.style.cssText = `
-                position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
-                background: rgba(0, 0, 0, 0.75); color: #ccc; padding: 8px 16px;
-                border-radius: 6px; font-family: sans-serif; font-size: 13px;
-                pointer-events: none; white-space: nowrap;
-            `;
-            msgOverlay.textContent = 'H265/yuv444 \u2014 browser playback not supported';
-            videoContainer.appendChild(msgOverlay);
-        };
-        fallbackImg.onerror = () => {
-            videoContainer.innerHTML = `
-                <div style="color: #aaa; font-family: sans-serif; text-align: center;">
-                    <div style="font-size: 48px; margin-bottom: 10px;">\uD83C\uDFAC</div>
-                    <div>This video format cannot be played in the browser</div>
-                    <div style="font-size: 12px; margin-top: 5px; opacity: 0.7;">H265 or yuv444 encoded</div>
-                </div>
-            `;
-        };
-        fallbackImg.src = frameUrl;
-    };
-
-    videoContainer.appendChild(video);
-
-    // Create keyboard hint
-    const hint = document.createElement('div');
-    hint.textContent = 'Press ESC or click outside to close';
-    hint.style.cssText = `
-        position: absolute;
-        bottom: 20px;
-        color: rgba(255, 255, 255, 0.5);
-        font-size: 12px;
-        font-family: sans-serif;
-    `;
-
-    overlay.appendChild(header);
-    overlay.appendChild(videoContainer);
-    overlay.appendChild(hint);
-
-    // Close on overlay click (but not video click)
-    overlay.onclick = (e) => {
-        if (e.target === overlay) {
-            overlay.remove();
-        }
-    };
-
-    // Close on ESC key
-    const handleKeydown = (e) => {
-        if (e.key === 'Escape') {
-            overlay.remove();
-            document.removeEventListener('keydown', handleKeydown);
-        }
-    };
-    document.addEventListener('keydown', handleKeydown);
-
-    // Add to document
-    document.body.appendChild(overlay);
-
-    // Focus video for keyboard controls
-    video.focus();
-}
-
-/**
- * Check if filename is a video file
- */
-function isVideoFile(filename) {
-    if (!filename) return false;
-    const ext = filename.split('.').pop().toLowerCase();
-    return ['mp4', 'webm', 'mov', 'avi', 'mkv', 'm4v', 'wmv'].includes(ext);
-}
-
-/**
- * Check if filename is a previewable file (image or video)
+ * Check if filename is a previewable file (image only)
  */
 function isPreviewableFile(filename) {
     if (!filename || filename === '(none)') return false;
     const ext = filename.split('.').pop().toLowerCase();
     const imageExtensions = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'];
-    const videoExtensions = ['mp4', 'webm', 'mov', 'avi', 'mkv', 'm4v', 'wmv'];
-    return imageExtensions.includes(ext) || videoExtensions.includes(ext);
+    return imageExtensions.includes(ext);
 }
 
 console.log("[MetaPromptExtractor] Extension starting registration...");
@@ -2579,33 +1883,6 @@ app.registerExtension({
 
     async setup() {
         console.log("[MetaPromptExtractor] setup() called");
-        // Listen for frame extraction requests from Python backend
-        api.addEventListener("prompt-extractor-extract-frame", async (event) => {
-            const { filename, frame_position } = event.detail;
-            console.log(`[MetaPromptExtractor] Received extraction request for ${filename} at position ${frame_position}`);
-            
-            // Find the node with this filename
-            if (app.graph && app.graph._nodes) {
-                for (const node of app.graph._nodes) {
-                    if (node.type === "MetaPromptExtractor") {
-                        const imageWidget = node.widgets?.find(w => w.name === "image");
-                        const frameWidget = node.widgets?.find(w => w.name === "frame_position");
-                        
-                        if (imageWidget && imageWidget.value === filename) {
-                            // Update frame position if provided
-                            if (frameWidget && frame_position !== undefined) {
-                                frameWidget.value = frame_position;
-                            }
-                            
-                            // Trigger extraction
-                            await loadAndDisplayImage(node, filename);
-                            console.log(`[MetaPromptExtractor] Extracted and cached frame for ${filename}`);
-                            break;
-                        }
-                    }
-                }
-            }
-        });
     },
 
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
@@ -2646,13 +1923,10 @@ app.registerExtension({
 
             // ── Find widgets synchronously — they exist at onNodeCreated time
             //    because "image" is now a COMBO widget (list), not STRING ──
-            let imageWidget        = node.widgets?.find(w => w.name === "image");
-            const framePositionWidget = node.widgets?.find(w => w.name === "frame_position");
+            let imageWidget = node.widgets?.find(w => w.name === "image");
 
             if (!imageWidget) {
                 console.warn("[MetaPromptExtractor] image widget not found — creating manually");
-                // Manually create the combo widget if it wasn't created
-                // This is a minimal LiteGraph-compatible combo box
                 const comboWidget = {
                     name: "image",
                     type: "combo",
@@ -2660,7 +1934,6 @@ app.registerExtension({
                     options: ["(none)", ""],
                     callback: () => {},
                     serialize: true,
-                    // Minimal LiteGraph properties
                     draw: function(ctx, size, pos) { /* handled by LiteGraph */ },
                     computeSize: function() { return [300, 20]; },
                 };
@@ -2678,11 +1951,6 @@ app.registerExtension({
             imageWidget.callback = function(value) {
                 if (origImageCb) origImageCb.apply(this, arguments);
                 node._metadataCached = false;
-                if (framePositionWidget) {
-                    const ext = (value || "").split(".").pop().toLowerCase();
-                    framePositionWidget.hidden = !["mp4","webm","mov","avi"].includes(ext);
-                    if (!["mp4","webm","mov","avi"].includes(ext)) framePositionWidget.value = 0;
-                }
                 loadAndDisplayImage(node, value);
             };
 
@@ -2747,22 +2015,6 @@ app.registerExtension({
             };
             node.widgets.splice(imageWidgetIndex + 1, 0, browseButton);
 
-            // ── Frame position slider: show only for videos, debounce scrub ──
-            if (framePositionWidget) {
-                framePositionWidget.serialize = true;
-                framePositionWidget.hidden    = true;
-                const origFrameCb = framePositionWidget.callback;
-                let frameTimer = null;
-                framePositionWidget.callback = function(value) {
-                    if (origFrameCb) origFrameCb.apply(this, arguments);
-                    clearTimeout(frameTimer);
-                    frameTimer = setTimeout(() => {
-                        const fp = imageWidget.value || "";
-                        if (fp && isVideoFile(fp)) loadVideoFrame(node, fp);
-                    }, 300);
-                };
-            }
-
             // ── onConfigure: restore preview when workflow is loaded ──
             const origConfigure = node.onConfigure;
             node.onConfigure = function(info) {
@@ -2794,11 +2046,6 @@ app.registerExtension({
                             newImageWidget.callback = function(value) {
                                 if (origImageCb) origImageCb.apply(this, arguments);
                                 node._metadataCached = false;
-                                const framePositionWidget = node.widgets?.find(w => w.name === "frame_position");
-                                if (framePositionWidget) {
-                                    const ext = (value || "").split(".").pop().toLowerCase();
-                                    framePositionWidget.hidden = !["mp4","webm","mov","avi"].includes(ext);
-                                }
                                 loadAndDisplayImage(node, value);
                             };
                             console.log("[MetaPromptExtractor] Converted input to widget successfully");
@@ -2895,9 +2142,6 @@ app.registerExtension({
                 setTimeout(() => {
                     const fp = imageWidget.value || "";
                     if (fp && fp !== "(none)" && fp !== "") {
-                        if (framePositionWidget) {
-                            framePositionWidget.hidden = !isVideoFile(fp);
-                        }
                         loadAndDisplayImage(node, fp);
                     } else {
                         showPlaceholder(node);
@@ -2911,7 +2155,6 @@ app.registerExtension({
             setTimeout(() => {
                 const fp = imageWidget.value || "";
                 if (fp && fp !== "(none)" && fp !== "") {
-                    if (framePositionWidget) framePositionWidget.hidden = !isVideoFile(fp);
                     loadAndDisplayImage(node, fp);
                 } else {
                     showPlaceholder(node);
@@ -2928,30 +2171,27 @@ app.registerExtension({
                 const file = e.dataTransfer?.files?.[0];
                 if (!file) return false;
                 const ext = file.name.split(".").pop().toLowerCase();
-                if (!["png","jpg","jpeg","webp","json","mp4","webm","mov","avi"].includes(ext)) return false;
+                if (!["png","jpg","jpeg","webp"].includes(ext)) return false;
                 let metadata = null;
                 try {
                     if (ext === "png")                    metadata = await getPNGMetadata(file);
                     else if (["jpg","jpeg"].includes(ext)) metadata = await getJPEGMetadata(file);
                     else if (ext === "webp")              metadata = await getWebPMetadata(file);
-                    else if (ext === "json")              metadata = await getJSONMetadata(file);
                 } catch (_) {}
                 await cacheFileMetadata(file.name, metadata);
                 imageWidget.value = file.name;
                 node._metadataCached = true;
                 node.hasWorkflow = !!(metadata?.workflow || metadata?.parameters);
-                if (["png","jpg","jpeg","webp"].includes(ext)) {
-                    const blobUrl = URL.createObjectURL(file);
-                    const img = new Image();
-                    img.onload = () => {
-                        node.imgs = [img]; node.imageIndex = 0;
-                        node._loadedImageFilename = file.name;
-                        const w = Math.max(node.size[0], 256);
-                        node.setSize([w, Math.max(node.size[1], img.naturalHeight*(w/img.naturalWidth)+100)]);
-                        node.setDirtyCanvas(true, true);
-                    };
-                    img.src = blobUrl;
-                } else { showPlaceholder(node); }
+                const blobUrl = URL.createObjectURL(file);
+                const img = new Image();
+                img.onload = () => {
+                    node.imgs = [img]; node.imageIndex = 0;
+                    node._loadedImageFilename = file.name;
+                    const w = Math.max(node.size[0], 256);
+                    node.setSize([w, Math.max(node.size[1], img.naturalHeight*(w/img.naturalWidth)+100)]);
+                    node.setDirtyCanvas(true, true);
+                };
+                img.src = blobUrl;
                 node.setDirtyCanvas(true);
                 return true;
             };
@@ -2962,7 +2202,7 @@ app.registerExtension({
 });
 
 /**
- * Extract metadata and update recipe indicator (without affecting display)
+ * Extract metadata and update workflow indicator (without affecting display)
  */
 async function extractAndUpdateMetadata(node, filename) {
     if (!filename || filename === "(none)") {
@@ -2992,75 +2232,21 @@ async function extractAndUpdateMetadata(node, filename) {
         const fileBlob = await response.blob();
         let metadata = null;
 
-        // Extract based on file type
         if (ext === 'png') {
             metadata = await getPNGMetadata(fileBlob);
         } else if (ext === 'webp') {
             metadata = await getWebPMetadata(fileBlob);
         } else if (['jpg', 'jpeg'].includes(ext)) {
             metadata = await getJPEGMetadata(fileBlob);
-        } else if (ext === 'json') {
-            metadata = await getJSONMetadata(fileBlob);
-        } else if (['mp4', 'webm', 'mov', 'avi'].includes(ext)) {
-            console.log(`[MetaPromptExtractor] Attempting JavaScript video metadata extraction for: ${filename}`);
-            metadata = await getVideoMetadata(fileBlob);
-            
-            // If JavaScript parser failed, ask Python to try with ffprobe
-            if (metadata === null) {
-                console.log(`[MetaPromptExtractor] JavaScript parser returned null, trying Python ffprobe for: ${filename}`);
-                metadata = await extractVideoMetadataWithPython(filename, viewType);
-                
-                if (metadata) {
-                    console.log(`[MetaPromptExtractor] Successfully got metadata from Python for: ${filename}`);
-                } else {
-                    console.log(`[MetaPromptExtractor] Python also returned no metadata for: ${filename}`);
-                }
-            } else {
-                console.log(`[MetaPromptExtractor] JavaScript successfully extracted metadata for: ${filename}`);
-            }
         }
 
-        // Cache metadata for Python backend (only if we extracted it and Python doesn't already have it)
         if (metadata !== null) {
             await cacheFileMetadata(filename, metadata);
         }
 
-        // Update recipe status
-        if (ext === 'json') {
-            node.hasWorkflow = !!(metadata && (metadata.workflow || (metadata.nodes && metadata.links)));
-        } else {
-            // Check for ComfyUI workflow or A1111 parameters
-            node.hasWorkflow = !!(metadata && (metadata.workflow || metadata.parameters));
-        }
-
-        // Force canvas redraw to update indicator
+        node.hasWorkflow = !!(metadata && (metadata.workflow || metadata.parameters));
         node.setDirtyCanvas(true, true);
         app.graph.setDirtyCanvas(true, true);
-
-        // Extract full preview data for RecipeBuilder's "Update Recipe" button.
-        // Runs the Python parse+build pipeline on the cached metadata so WB can
-        // pull it without executing PromptExtractor (live-menu pattern).
-        if (node.hasWorkflow) {
-            try {
-                const sourceFolder = node._sourceFolder || 'input';
-                const _absPreview = isAbsolutePath(filename);
-                const _previewUrl = _absPreview
-                    ? `/meta-prompt-extractor/extract-preview-abs?path=${encodeURIComponent(filename)}`
-                    : `/meta-prompt-extractor/extract-preview?filename=${encodeURIComponent(filename)}&source=${encodeURIComponent(sourceFolder)}`;
-                const previewResp = await fetch(_previewUrl);
-                if (previewResp.ok) {
-                    const previewData = await previewResp.json();
-                    if (previewData.extracted) {
-                        const normalizedExtracted = _normalizeExtractedLoraOrder(previewData.extracted);
-                        node.properties = node.properties || {};
-                        node.properties.pe_extracted_data = JSON.stringify(normalizedExtracted);
-                        console.log(`[MetaPromptExtractor] Cached extracted preview data for: ${filename}`);
-                    }
-                }
-            } catch (previewErr) {
-                console.warn('[MetaPromptExtractor] Could not cache preview data:', previewErr);
-            }
-        }
     } catch (error) {
         console.error("[MetaPromptExtractor] Error extracting metadata:", error);
         node.hasWorkflow = false;
@@ -3073,34 +2259,18 @@ async function extractAndUpdateMetadata(node, filename) {
  */
 async function loadAndDisplayImage(node, filename) {
     if (!filename) {
-        // Show placeholder for empty
         showPlaceholder(node);
         return;
     }
 
-    // Check file extension to determine if it's an image or video
     const ext = filename.split('.').pop().toLowerCase();
     const imageExtensions = ['png', 'jpg', 'jpeg', 'webp'];
-    const videoExtensions = ['mp4', 'webm', 'mov', 'avi'];
-
-    if (videoExtensions.includes(ext)) {
-        // It's a video - extract and display frame at specified position
-        loadVideoFrame(node, filename);
-        return;
-    }
 
     if (!imageExtensions.includes(ext)) {
-        // Handle JSON files
-        if (ext === 'json') {
-            loadJSONFile(node, filename);
-        } else {
-            // Unknown file type - show placeholder
-            showPlaceholder(node);
-        }
+        showPlaceholder(node);
         return;
     }
 
-    // It's an image - load, display, and extract metadata
     loadImageFile(node, filename);
 }
 
@@ -3162,213 +2332,6 @@ async function loadImageFile(node, filename) {
         img.src = fileUrl + (fileUrl.includes('?') ? '&' : '?') + 't=' + Date.now();
     } catch (error) {
         console.error("[MetaPromptExtractor] Error loading image:", error);
-        showPlaceholder(node);
-    }
-}
-
-/**
- * Load a JSON file and extract metadata
- */
-async function loadJSONFile(node, filename) {
-    try {
-        const viewType = node._sourceFolder || 'input';
-        const fileUrl = buildFileUrl(filename, viewType);
-        if (!fileUrl) { showPlaceholder(node); return; }
-        const jsonBlob = await fetch(fileUrl).then(res => res.blob());
-
-        // Extract metadata from JSON file
-        const metadata = await getJSONMetadata(jsonBlob);
-        // Cache metadata (or lack thereof) for Python backend
-        await cacheFileMetadata(filename, metadata);
-
-        // Update recipe status flag
-        // Check if metadata has workflow property OR if metadata itself is a workflow (has nodes/links)
-        node.hasWorkflow = !!(metadata && (metadata.workflow || (metadata.nodes && metadata.links)));
-        // Track that this JSON is now loaded
-        node._loadedImageFilename = filename;
-        
-        // Force canvas redraw to update indicator immediately
-        node.setDirtyCanvas(true, true);
-        app.graph.setDirtyCanvas(true, true);
-
-        // Show placeholder for JSON files (no visual preview)
-        showPlaceholder(node);
-    } catch (error) {
-        console.error("[MetaPromptExtractor] Error loading JSON:", error);
-        showPlaceholder(node);
-    }
-}
-
-/**
- * Load a video frame from the server-side PyAV endpoint (for H265/yuv444 videos).
- */
-function loadVideoFrameFromServer(node, filename, framePosition, viewType) {
-    const frameUrl = isAbsolutePath(filename)
-        ? `/meta-prompt-extractor/video-frame?path=${encodeURIComponent(filename)}&position=${framePosition}`
-        : `/meta-prompt-extractor/video-frame?filename=${encodeURIComponent(filename)}&source=${viewType}&position=${framePosition}`;
-    const img = new Image();
-    img.onload = () => {
-        node.imgs = [img];
-        node.imageIndex = 0;
-        node._loadedImageFilename = filename;
-        node._loadedFramePosition = framePosition;
-
-        // Cache as base64 for Python backend
-        const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0);
-        const frameData = canvas.toDataURL('image/png');
-        cacheVideoFrame(filename, frameData, framePosition);
-
-        // Resize node to fit image
-        const targetWidth = Math.max(node.size[0], 256);
-        const targetHeight = Math.max(node.size[1], img.naturalHeight * (targetWidth / img.naturalWidth) + 100);
-        node.setSize([targetWidth, targetHeight]);
-
-        node.setDirtyCanvas(true, true);
-        app.graph.setDirtyCanvas(true, true);
-    };
-    img.onerror = () => {
-        console.error(`[MetaPromptExtractor] Server-side frame extraction failed for: ${filename}`);
-        showPlaceholder(node);
-    };
-    img.src = frameUrl;
-}
-
-/**
- * Load frame from a video file at specified position and extract metadata
- */
-async function loadVideoFrame(node, filename) {
-    try {
-        // Get frame position from the widget (0.0 to 1.0)
-        const framePositionWidget = node.widgets?.find(w => w.name === "frame_position");
-        const framePosition = framePositionWidget ? framePositionWidget.value : 0.0;
-        const viewType = node._sourceFolder || 'input';
-
-        const videoUrl = buildFileUrl(filename, viewType);
-        if (!videoUrl) { showPlaceholder(node); return; }
-
-        // If this video is already known to be non-browser-decodable, go straight to server
-        if (_nonBrowserDecodableVideos.has(filename)) {
-            // Still fetch metadata on first load (not on scrub)
-            if (!node._metadataCached) {
-                try {
-                    const videoBlob = await fetch(videoUrl).then(res => res.blob());
-                    const metadata = await getVideoMetadata(videoBlob);
-                    await cacheFileMetadata(filename, metadata);
-                    node.hasWorkflow = !!(metadata && (metadata.workflow || metadata.parameters));
-                    node._metadataCached = true;
-                    node.setDirtyCanvas(true, true);
-                } catch (e) {
-                    console.warn("[MetaPromptExtractor] Metadata extraction failed:", e);
-                }
-            }
-            loadVideoFrameFromServer(node, filename, framePosition, viewType);
-            return;
-        }
-
-        // Fetch metadata only once per video (not on every scrub)
-        if (!node._metadataCached) {
-            try {
-                const videoBlob = await fetch(videoUrl).then(res => res.blob());
-
-                // Extract metadata from video file
-                const metadata = await getVideoMetadata(videoBlob);
-                // Cache metadata (or lack thereof) for Python backend
-                await cacheFileMetadata(filename, metadata);
-                node._metadataCached = true;
-
-                // Update recipe status flag - check for workflow or parameters
-                node.hasWorkflow = !!(metadata && (metadata.workflow || metadata.parameters));
-
-                // Force canvas redraw to update indicator immediately
-                node.setDirtyCanvas(true, true);
-                app.graph.setDirtyCanvas(true, true);
-            } catch (e) {
-                console.warn("[MetaPromptExtractor] Metadata extraction failed:", e);
-            }
-        }
-
-        // Create a video element for frame extraction
-        const video = document.createElement('video');
-        video.crossOrigin = 'anonymous';
-        video.preload = 'auto';
-        video.muted = true;
-        video.playsInline = true;
-        video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
-
-        const cleanupVideo = () => {
-            video.onloadedmetadata = null;
-            video.onseeked = null;
-            video.onerror = null;
-            try { video.src = ''; video.load(); } catch (e) { /* ignore */ }
-            if (video.parentNode) video.parentNode.removeChild(video);
-        };
-
-        video.onloadedmetadata = () => {
-            // Calculate frame time based on position (0.0 = start, 1.0 = end)
-            const frameTime = framePosition * Math.max(0, video.duration - 0.1);
-            video.currentTime = frameTime;
-        };
-
-        video.onseeked = () => {
-            // Create canvas to draw the video frame
-            const canvas = document.createElement('canvas');
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            const ctx = canvas.getContext('2d');
-
-            // Draw the video frame to canvas
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-            // Convert canvas to image
-            const img = new Image();
-            img.onload = () => {
-                // Display the frame
-                node.imgs = [img];
-                node.imageIndex = 0;
-                // Track that this video frame is now loaded at this specific position
-                node._loadedImageFilename = filename;
-                node._loadedFramePosition = framePosition;
-
-                // Cache frame as base64 for Python backend
-                const frameData = canvas.toDataURL('image/png');
-                cacheVideoFrame(filename, frameData, framePosition);
-
-                // Resize node to fit image
-                const targetWidth = Math.max(node.size[0], 256);
-                const targetHeight = Math.max(node.size[1], img.naturalHeight * (targetWidth / img.naturalWidth) + 100);
-                node.setSize([targetWidth, targetHeight]);
-
-                node.setDirtyCanvas(true, true);
-                app.graph.setDirtyCanvas(true, true);
-                cleanupVideo();
-            };
-
-            img.onerror = () => {
-                console.error(`[MetaPromptExtractor] Failed to create image from video frame at position ${framePosition.toFixed(2)}`);
-                cleanupVideo();
-                showPlaceholder(node);
-            };
-
-            img.src = canvas.toDataURL('image/png');
-        };
-
-        video.onerror = () => {
-            console.log(`[MetaPromptExtractor] Browser cannot decode video, using server-side extraction: ${filename}`);
-            // Remember this video can't be decoded by browser - skip browser attempt on future scrubs
-            _nonBrowserDecodableVideos.add(filename);
-            cleanupVideo();
-            loadVideoFrameFromServer(node, filename, framePosition, viewType);
-        };
-
-        // Append to DOM (some browsers require this for decoding) and load
-        document.body.appendChild(video);
-        video.src = videoUrl + (videoUrl.includes('?') ? '&' : '?') + 't=' + Date.now();
-    } catch (error) {
-        console.error("[MetaPromptExtractor] Error loading video:", error);
         showPlaceholder(node);
     }
 }
