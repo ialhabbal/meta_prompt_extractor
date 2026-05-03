@@ -10,6 +10,6 @@ Repository = "https://github.com/ialhabbal/meta_prompt_extractor"
 
 [tool.comfy]
 PublisherId = "ialhabbal"
-DisplayName = "Save_It"
+DisplayName = "meta_prompt_extractor"
 Icon = "https://raw.githubusercontent.com/ialhabbal/meta_prompt_extractor/main/media/meta_prompt_extractor.png"
 includes = []
