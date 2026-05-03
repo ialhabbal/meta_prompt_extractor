@@ -177,4 +177,10 @@ License: MIT
 
 ---
 
-Developed by: ialhabbal
+Extracted and re-imagined by: ialhabbal
+
+---
+
+Credit: https://github.com/FranckyB/ComfyUI-Prompt-Manager
+
+---
