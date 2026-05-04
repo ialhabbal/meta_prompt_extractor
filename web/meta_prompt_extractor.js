@@ -224,10 +224,18 @@ async function createFileBrowserModal(currentFile, onSelect) {
     };
 
     const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9000;display:flex;align-items:center;justify-content:center;';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9000;';
+
+    // ── Initial size & centered position ──────────────────────────────────────
+    const INIT_W = Math.min(900, Math.round(window.innerWidth  * 0.96));
+    const INIT_H = Math.min(520, Math.round(window.innerHeight * 0.90));
+    const INIT_X = Math.round((window.innerWidth  - INIT_W) / 2);
+    const INIT_Y = Math.round((window.innerHeight - INIT_H) / 2);
+    const MIN_W  = 420;
+    const MIN_H  = 300;
 
     const modal = document.createElement('div');
-    modal.style.cssText = 'background:#1e2530;border:1px solid #3a4a5a;border-radius:10px;width:min(900px,96vw);height:min(520px,90vh);display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,0.6);font-family:sans-serif;overflow:hidden;';
+    modal.style.cssText = `position:fixed;left:${INIT_X}px;top:${INIT_Y}px;width:${INIT_W}px;height:${INIT_H}px;background:#1e2530;border:1px solid #3a4a5a;border-radius:10px;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,0.6);font-family:sans-serif;overflow:hidden;z-index:9001;box-sizing:border-box;`;
     overlay.appendChild(modal);
 
     // Header
@@ -241,6 +249,67 @@ async function createFileBrowserModal(currentFile, onSelect) {
     closeBtn.style.cssText = 'background:none;border:none;color:#8aaccc;font-size:16px;cursor:pointer;padding:2px 6px;border-radius:4px;line-height:1;';
     header.appendChild(title); header.appendChild(closeBtn);
     modal.appendChild(header);
+
+    // ── Drag-to-move — attached to header ────────────────────────────────────
+    header.style.cursor = 'grab';
+    header.addEventListener('mousedown', (mde) => {
+        // Ignore clicks on the close button
+        if (mde.target === closeBtn || closeBtn.contains(mde.target)) return;
+        mde.preventDefault();
+        header.style.cursor = 'grabbing';
+        const startX = mde.clientX - modal.offsetLeft;
+        const startY = mde.clientY - modal.offsetTop;
+        const onMove = (mme) => {
+            let nx = mme.clientX - startX;
+            let ny = mme.clientY - startY;
+            // Keep modal fully on-screen
+            nx = Math.max(0, Math.min(nx, window.innerWidth  - modal.offsetWidth));
+            ny = Math.max(0, Math.min(ny, window.innerHeight - modal.offsetHeight));
+            modal.style.left = nx + 'px';
+            modal.style.top  = ny + 'px';
+        };
+        const onUp = () => {
+            header.style.cursor = 'grab';
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup',   onUp);
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup',   onUp);
+    });
+
+    // ── Resize handle — bottom-right corner ──────────────────────────────────
+    const resizeHandle = document.createElement('div');
+    resizeHandle.style.cssText = 'position:absolute;bottom:0;right:0;width:18px;height:18px;cursor:se-resize;z-index:10;';
+    // Subtle visual grip dots
+    resizeHandle.innerHTML = `<svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" style="display:block;opacity:0.35;">
+        <circle cx="14" cy="14" r="1.5" fill="#9ab8d0"/>
+        <circle cx="10" cy="14" r="1.5" fill="#9ab8d0"/>
+        <circle cx="14" cy="10" r="1.5" fill="#9ab8d0"/>
+    </svg>`;
+    resizeHandle.addEventListener('mousedown', (mde) => {
+        mde.preventDefault();
+        mde.stopPropagation();
+        const startX  = mde.clientX;
+        const startY  = mde.clientY;
+        const startW  = modal.offsetWidth;
+        const startH  = modal.offsetHeight;
+        const onMove  = (mme) => {
+            const nw = Math.max(MIN_W, startW + (mme.clientX - startX));
+            const nh = Math.max(MIN_H, startH + (mme.clientY - startY));
+            // Keep within viewport
+            const maxW = window.innerWidth  - modal.offsetLeft;
+            const maxH = window.innerHeight - modal.offsetTop;
+            modal.style.width  = Math.min(nw, maxW) + 'px';
+            modal.style.height = Math.min(nh, maxH) + 'px';
+        };
+        const onUp = () => {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup',   onUp);
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup',   onUp);
+    });
+    modal.appendChild(resizeHandle);
 
     // Main content area with sidebar
     const mainContent = document.createElement('div');
@@ -1423,13 +1492,22 @@ async function getPNGMetadata(file) {
                         try {
                             prompt = JSON.parse(text);
                         } catch (e) {
-                            console.error('[MetaPromptExtractor] Failed to parse prompt metadata:', e);
+                            // JSON.parse rejects values like NaN that are valid JS but
+                            // not valid JSON (e.g. ComfyUI encodes NaN in some nodes).
+                            // Store the raw string so Python receives it and can process
+                            // it exactly as PIL does — Python's _coerce_to_dict handles
+                            // the raw string and its json.loads is more forgiving, or
+                            // parse_workflow_for_prompts can work from raw string data.
+                            console.warn('[MetaPromptExtractor] prompt chunk is not strict JSON, storing raw string for Python:', e.message);
+                            prompt = text;
                         }
                     } else if (keyword === 'workflow') {
                         try {
                             workflow = JSON.parse(text);
                         } catch (e) {
-                            console.error('[MetaPromptExtractor] Failed to parse workflow metadata:', e);
+                            // Same treatment as prompt — preserve raw string for Python.
+                            console.warn('[MetaPromptExtractor] workflow chunk is not strict JSON, storing raw string for Python:', e.message);
+                            workflow = text;
                         }
                     } else if (keyword === 'parameters') {
                         // A1111/Forge generation parameters (ComfyUI can load workflow from this)
@@ -2172,23 +2250,73 @@ app.registerExtension({
                 if (!file) return false;
                 const ext = file.name.split(".").pop().toLowerCase();
                 if (!["png","jpg","jpeg","webp"].includes(ext)) return false;
+
+                // ── Step 1: Extract metadata from the original file bytes BEFORE
+                //    any re-encoding happens. This is the only reliable read because
+                //    ComfyUI's /view endpoint strips PNG text chunks when serving. ──
                 let metadata = null;
                 try {
-                    if (ext === "png")                    metadata = await getPNGMetadata(file);
+                    if (ext === "png")                     metadata = await getPNGMetadata(file);
                     else if (["jpg","jpeg"].includes(ext)) metadata = await getJPEGMetadata(file);
-                    else if (ext === "webp")              metadata = await getWebPMetadata(file);
+                    else if (ext === "webp")               metadata = await getWebPMetadata(file);
                 } catch (_) {}
-                await cacheFileMetadata(file.name, metadata);
-                imageWidget.value = file.name;
+
+                // ── Step 2: Upload the file to ComfyUI's input directory.
+                //    This is mandatory: Python's extract() calls os.path.isfile() and
+                //    returns empty strings immediately if the file doesn't exist on disk,
+                //    before ever consulting the metadata cache. ──
+                let resolvedFilename = file.name; // fallback if upload fails
+                try {
+                    const formData = new FormData();
+                    formData.append("image", file, file.name);
+                    formData.append("overwrite", "true");
+                    const uploadResp = await api.fetchApi("/upload/image", {
+                        method: "POST",
+                        body: formData,
+                    });
+                    if (uploadResp.ok) {
+                        const uploadData = await uploadResp.json();
+                        // ComfyUI returns { name, subfolder, type }.
+                        // Reconstruct the relative path Python will compute via
+                        // os.path.relpath(resolved, input_dir): e.g. "image.png"
+                        // or "subfolder/image.png".
+                        const sub = uploadData.subfolder ? uploadData.subfolder + "/" : "";
+                        resolvedFilename = sub + uploadData.name;
+                    } else {
+                        console.warn("[MetaPromptExtractor] Upload failed, Python will not find file on disk");
+                    }
+                } catch (uploadErr) {
+                    console.warn("[MetaPromptExtractor] Upload error:", uploadErr);
+                }
+
+                // ── Step 3: Cache the JS-extracted metadata under the resolved filename.
+                //    Python's extract_metadata_from_png/jpeg checks this cache first,
+                //    keyed by os.path.relpath(file_path, input_dir) — which equals
+                //    resolvedFilename for files in the input directory. ──
+                await cacheFileMetadata(resolvedFilename, metadata);
+
+                // ── Step 4: Update widget and node state. ──
+                imageWidget.value   = resolvedFilename;
                 node._metadataCached = true;
-                node.hasWorkflow = !!(metadata?.workflow || metadata?.parameters);
+                node.hasWorkflow    = !!(metadata?.workflow || metadata?.parameters);
+
+                // ── Step 5: Display image from the original blob (NOT via /view).
+                //    We deliberately avoid calling loadImageFile() here because it
+                //    re-fetches via /view which strips PNG metadata, causing it to
+                //    call cacheFileMetadata(resolvedFilename, null) — which would
+                //    leave no cache entry and force Python to fall back to PIL.
+                //    PIL CAN read the file on disk, but only if /view hasn't also
+                //    stripped the on-disk copy (which it hasn't — /view serves from
+                //    the original bytes). So either path works, but using the blob
+                //    is faster and avoids the extra round-trip. ──
                 const blobUrl = URL.createObjectURL(file);
                 const img = new Image();
                 img.onload = () => {
-                    node.imgs = [img]; node.imageIndex = 0;
-                    node._loadedImageFilename = file.name;
+                    node.imgs = [img];
+                    node.imageIndex = 0;
+                    node._loadedImageFilename = resolvedFilename;
                     const w = Math.max(node.size[0], 256);
-                    node.setSize([w, Math.max(node.size[1], img.naturalHeight*(w/img.naturalWidth)+100)]);
+                    node.setSize([w, Math.max(node.size[1], img.naturalHeight * (w / img.naturalWidth) + 100)]);
                     node.setDirtyCanvas(true, true);
                 };
                 img.src = blobUrl;

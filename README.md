@@ -41,6 +41,11 @@ This node works differently:
 
 3. **No additional dependencies needed** — Uses only standard ComfyUI libraries (PIL, torch, numpy)
 
+## Update 1.6.0
+
+- Browse Files floating window now detached and resizeable. 
+- Imporved drag and drop images onto the node to read the prompts, positive and negative (if there is a negative) 
+
 ## How to Use
 
 ### Adding the Node
@@ -178,5 +183,3 @@ License: MIT
 ---
 
 Developed by: ialhabbal
-
----

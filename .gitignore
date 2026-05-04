@@ -160,6 +160,6 @@ cython_debug/
 #.idea/
 # PromptVerify local / user data
 desktop.ini
+Desktop.ini
 prompt_verify_data.json
 node.zip
-.ruff_cache
