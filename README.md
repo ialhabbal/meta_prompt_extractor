@@ -43,8 +43,8 @@ This node works differently:
 
 ## Update 1.6.0
 
-- Browse Files floating window now detached and resizeable. 
-- Imporved drag and drop images onto the node to read the prompts, positive and negative (if there is a negative) 
+- Browse Files floating window now detached and resizable. 
+- Imporved drag and drop images onto the node to extract the prompts, positive and negative (if there is a negative) 
 
 ## How to Use
 
