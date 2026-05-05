@@ -978,38 +978,106 @@ async def _list_filesystem_roots(request):
     except Exception as e:
         return server.web.json_response({"roots": ["/"], "error": str(e)}, status=500)
 
-def _check_file_has_metadata(file_path):
+def _fast_png_has_metadata(file_path):
+    """
+    Check PNG tEXt/iTXt/zTXt chunks for 'prompt' or 'workflow' keys WITHOUT
+    decoding pixel data.  Reads only the chunk headers (12 bytes each) and the
+    keyword portion of text chunks — typically finishes in < 1 ms even on HDD.
+    Returns True as soon as a matching keyword is found.
+    """
+    TARGET = {b'prompt', b'workflow', b'Comment', b'parameters'}
     try:
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext not in ['.png', '.jpg', '.jpeg', '.webp', '.json']:
-            return False
-        
+        with open(file_path, 'rb') as fh:
+            sig = fh.read(8)
+            if sig != b'\x89PNG\r\n\x1a\n':
+                return False
+            while True:
+                hdr = fh.read(8)
+                if len(hdr) < 8:
+                    break
+                length = int.from_bytes(hdr[:4], 'big')
+                chunk_type = hdr[4:]
+                if chunk_type in (b'tEXt', b'iTXt', b'zTXt'):
+                    # Read just enough to get the null-terminated keyword (max 79 bytes)
+                    peek = min(length, 80)
+                    data = fh.read(peek)
+                    keyword = data.split(b'\x00', 1)[0]
+                    if keyword.lower() in {t.lower() for t in TARGET}:
+                        return True
+                    # Skip rest of chunk + CRC
+                    fh.seek(length - peek + 4, 1)
+                elif chunk_type == b'IDAT':
+                    # Pixel data started — no more metadata chunks after this
+                    break
+                else:
+                    fh.seek(length + 4, 1)  # skip data + CRC
+    except Exception:
+        pass
+    return False
+
+
+# In-memory metadata-presence cache: maps normalised path → bool
+# Populated during directory listing; cleared when the browse path changes.
+_has_metadata_cache = {}
+
+
+def _check_file_has_metadata(file_path):
+    """
+    Fast metadata-presence check used during directory listing.
+    Uses _fast_png_has_metadata() for PNGs (no PIL, no pixel decode).
+    Falls back to a quick binary grep for JPEG/WEBP EXIF markers.
+    Reads JSON files fully (they are usually small).
+    Results are cached in _has_metadata_cache so repeated calls are O(1).
+    """
+    try:
         cache_key = file_path.replace(os.sep, '/')
+        if cache_key in _has_metadata_cache:
+            return _has_metadata_cache[cache_key]
         if cache_key in _file_metadata_cache:
+            _has_metadata_cache[cache_key] = True
             return True
-        
-        if ext in ['.png', '.jpg', '.jpeg', '.webp'] and IMAGE_SUPPORT:
+
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in ('.png', '.jpg', '.jpeg', '.webp', '.json'):
+            _has_metadata_cache[cache_key] = False
+            return False
+
+        result = False
+
+        if ext == '.png':
+            result = _fast_png_has_metadata(file_path)
+
+        elif ext in ('.jpg', '.jpeg'):
+            # JFIF/EXIF: just check for APP1 marker (FF E1) in first 512 bytes
             try:
-                with Image.open(file_path) as img:
-                    if ext == '.png':
-                        return 'prompt' in img.info or 'workflow' in img.info
-                    elif ext in ['.jpg', '.jpeg', '.webp']:
-                        exif = img.getexif()
-                        return bool(exif)
-            except:
-                pass
-        
-        if ext == '.json':
+                with open(file_path, 'rb') as fh:
+                    header = fh.read(512)
+                result = b'\xff\xe1' in header  # APP1 = Exif or XMP
+            except Exception:
+                result = False
+
+        elif ext == '.webp':
+            # WEBP EXIF chunk starts with b'EXIF'; XMP with b'XMP '
+            try:
+                with open(file_path, 'rb') as fh:
+                    header = fh.read(256)
+                result = b'EXIF' in header or b'XMP ' in header
+            except Exception:
+                result = False
+
+        elif ext == '.json':
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    if isinstance(data, dict):
-                        return bool(data.get('nodes') or data.get('prompt') or data.get('workflow'))
-            except:
-                pass
-        
-        return False
-    except:
+                result = isinstance(data, dict) and bool(
+                    data.get('nodes') or data.get('prompt') or data.get('workflow')
+                )
+            except Exception:
+                result = False
+
+        _has_metadata_cache[cache_key] = result
+        return result
+    except Exception:
         return False
 
 @server.PromptServer.instance.routes.get("/meta-prompt-extractor/browse")
@@ -1021,6 +1089,10 @@ async def _browse_filesystem(request):
         path = os.path.normpath(path)
         if not os.path.isdir(path):
             return server.web.json_response({"error": "Not a directory"}, status=400)
+
+        # Clear per-directory metadata cache so it never grows unbounded
+        _has_metadata_cache.clear()
+
         entries = []
         try:
             for name in sorted(os.listdir(path), key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower())):

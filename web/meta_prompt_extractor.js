@@ -190,8 +190,30 @@ function showContextMenu(event, filePath, isDir, getBookmarks, addBookmark, remo
 
 async function createFileBrowserModal(currentFile, onSelect) {
     // ─── Bookmark Management ───
-    const BOOKMARKS_KEY = "metaPromptExtractor_bookmarks";
-    
+    const BOOKMARKS_KEY   = "metaPromptExtractor_bookmarks";
+
+    // ─── Persistent UI State ──────────────────────────────────────────────────
+    // Everything the user has arranged in the window (size, position, panel
+    // states) is stored under a single localStorage key as a JSON object so we
+    // can save / restore it atomically.
+    const UI_STATE_KEY = "metaPromptExtractor_uiState";
+
+    const loadUIState = () => {
+        try {
+            const raw = localStorage.getItem(UI_STATE_KEY);
+            return raw ? JSON.parse(raw) : {};
+        } catch { return {}; }
+    };
+
+    const saveUIState = (patch) => {
+        try {
+            const current = loadUIState();
+            localStorage.setItem(UI_STATE_KEY, JSON.stringify({ ...current, ...patch }));
+        } catch (e) {
+            console.warn("[MetaPromptExtractor] Failed to save UI state:", e);
+        }
+    };
+
     const getBookmarks = () => {
         try {
             const stored = localStorage.getItem(BOOKMARKS_KEY);
@@ -226,11 +248,16 @@ async function createFileBrowserModal(currentFile, onSelect) {
     const overlay = document.createElement('div');
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9000;';
 
-    // ── Initial size & centered position ──────────────────────────────────────
-    const INIT_W = Math.min(900, Math.round(window.innerWidth  * 0.96));
-    const INIT_H = Math.min(520, Math.round(window.innerHeight * 0.90));
-    const INIT_X = Math.round((window.innerWidth  - INIT_W) / 2);
-    const INIT_Y = Math.round((window.innerHeight - INIT_H) / 2);
+    // ── Initial size & centered position — restored from saved state if present ──
+    const _uiState = loadUIState();
+    const INIT_W = _uiState.modalW || Math.min(900, Math.round(window.innerWidth  * 0.96));
+    const INIT_H = _uiState.modalH || Math.min(520, Math.round(window.innerHeight * 0.90));
+    const INIT_X = _uiState.modalX != null
+        ? Math.min(_uiState.modalX, window.innerWidth  - INIT_W)
+        : Math.round((window.innerWidth  - INIT_W) / 2);
+    const INIT_Y = _uiState.modalY != null
+        ? Math.min(_uiState.modalY, window.innerHeight - INIT_H)
+        : Math.round((window.innerHeight - INIT_H) / 2);
     const MIN_W  = 420;
     const MIN_H  = 300;
 
@@ -270,6 +297,7 @@ async function createFileBrowserModal(currentFile, onSelect) {
         };
         const onUp = () => {
             header.style.cursor = 'grab';
+            saveUIState({ modalX: modal.offsetLeft, modalY: modal.offsetTop });
             document.removeEventListener('mousemove', onMove);
             document.removeEventListener('mouseup',   onUp);
         };
@@ -303,6 +331,7 @@ async function createFileBrowserModal(currentFile, onSelect) {
             modal.style.height = Math.min(nh, maxH) + 'px';
         };
         const onUp = () => {
+            saveUIState({ modalW: modal.offsetWidth, modalH: modal.offsetHeight });
             document.removeEventListener('mousemove', onMove);
             document.removeEventListener('mouseup',   onUp);
         };
@@ -316,18 +345,54 @@ async function createFileBrowserModal(currentFile, onSelect) {
     mainContent.style.cssText = 'display:flex;flex:1;min-height:0;';
 
     // ─── Sidebar (Bookmarks) ───
+    const SIDEBAR_MIN_W = 100;
+    const SIDEBAR_MAX_W = 340;
+    const _savedSidebarW = _uiState.sidebarW
+        ? Math.min(SIDEBAR_MAX_W, Math.max(SIDEBAR_MIN_W, _uiState.sidebarW))
+        : 160;
     const sidebar = document.createElement('div');
-    sidebar.style.cssText = 'width:160px;background:#161d27;border-right:1px solid #2e3d4e;overflow-y:auto;display:flex;flex-direction:column;flex-shrink:0;';
-    
+    sidebar.style.cssText = `width:${_savedSidebarW}px;background:#161d27;overflow-y:auto;display:flex;flex-direction:column;flex-shrink:0;position:relative;`;
+
     const bookmarksTitle = document.createElement('div');
-    bookmarksTitle.style.cssText = 'padding:10px 8px;font-size:11px;color:#7a9ab8;font-weight:700;text-transform:uppercase;border-bottom:1px solid #2e3d4e;flex-shrink:0;';
+    bookmarksTitle.style.cssText = 'padding:10px 8px;font-size:12px;color:#7a9ab8;font-weight:700;text-transform:uppercase;border-bottom:1px solid #2e3d4e;flex-shrink:0;';
     bookmarksTitle.textContent = '⭐ Favorites';
     sidebar.appendChild(bookmarksTitle);
-    
+
     const bookmarksList = document.createElement('div');
-    bookmarksList.style.cssText = 'flex:1;overflow-y:auto;';
+    bookmarksList.style.cssText = 'flex:1;overflow-y:auto;position:relative;';
     sidebar.appendChild(bookmarksList);
-    
+
+    // ── Sidebar resize handle (right edge) ──
+    const sidebarResizeHandle = document.createElement('div');
+    sidebarResizeHandle.style.cssText = 'position:absolute;top:0;right:0;width:5px;height:100%;cursor:col-resize;z-index:10;background:transparent;transition:background 0.15s;';
+    sidebarResizeHandle.title = 'Drag to resize favorites panel';
+    sidebarResizeHandle.onmouseenter = () => { sidebarResizeHandle.style.background = 'rgba(74,144,217,0.35)'; };
+    sidebarResizeHandle.onmouseleave = () => { sidebarResizeHandle.style.background = 'transparent'; };
+    sidebarResizeHandle.addEventListener('mousedown', (mde) => {
+        mde.preventDefault();
+        mde.stopPropagation();
+        const startX   = mde.clientX;
+        const startW   = sidebar.offsetWidth;
+        const onMove   = (mme) => {
+            const newW = Math.min(SIDEBAR_MAX_W, Math.max(SIDEBAR_MIN_W, startW + (mme.clientX - startX)));
+            sidebar.style.width = newW + 'px';
+        };
+        const onUp = () => {
+            sidebarResizeHandle.style.background = 'transparent';
+            saveUIState({ sidebarW: sidebar.offsetWidth });
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup',   onUp);
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup',   onUp);
+    });
+    sidebar.appendChild(sidebarResizeHandle);
+
+    // Thin visual divider on the right of the sidebar (sits on top of the handle)
+    const sidebarBorder = document.createElement('div');
+    sidebarBorder.style.cssText = 'position:absolute;top:0;right:0;width:1px;height:100%;background:#2e3d4e;pointer-events:none;';
+    sidebar.appendChild(sidebarBorder);
+
     mainContent.appendChild(sidebar);
 
     // ─── Right panel (files) ───
@@ -538,19 +603,90 @@ async function createFileBrowserModal(currentFile, onSelect) {
     mainContent.appendChild(rightPanel);
 
     // ─── Metadata Panel (Right side) ───
+    const METADATA_PANEL_W = 280; // stored width when expanded
+    let _metadataPanelCollapsed = !!_uiState.metadataCollapsed;
+
     const metadataPanel = document.createElement('div');
-    metadataPanel.style.cssText = 'width:280px;background:#161d27;border-left:1px solid #2e3d4e;overflow-hidden;display:flex;flex-direction:column;flex-shrink:0;';
-    
+    metadataPanel.style.cssText = `width:${METADATA_PANEL_W}px;background:#161d27;border-left:1px solid #2e3d4e;overflow:hidden;display:flex;flex-direction:column;flex-shrink:0;transition:width 0.2s ease;`;
+
     const metadataHeader = document.createElement('div');
-    metadataHeader.style.cssText = 'padding:10px 12px;font-size:12px;color:#7a9ab8;font-weight:700;text-transform:uppercase;border-bottom:1px solid #2e3d4e;flex-shrink:0;';
-    metadataHeader.textContent = '📋 Metadata';
+    metadataHeader.style.cssText = 'padding:10px 8px 10px 12px;font-size:12px;color:#7a9ab8;font-weight:700;text-transform:uppercase;border-bottom:1px solid #2e3d4e;flex-shrink:0;display:flex;align-items:center;gap:6px;';
+
+    const metadataHeaderLabel = document.createElement('span');
+    metadataHeaderLabel.style.cssText = 'flex:1;white-space:nowrap;overflow:hidden;';
+    metadataHeaderLabel.textContent = '📋 Metadata';
+    metadataHeader.appendChild(metadataHeaderLabel);
+
+    // Collapse / expand button
+    const metadataCollapseBtn = document.createElement('button');
+    metadataCollapseBtn.title = 'Collapse metadata panel';
+    metadataCollapseBtn.style.cssText = 'background:none;border:none;color:#7a9ab8;cursor:pointer;font-size:13px;padding:2px 4px;border-radius:4px;line-height:1;flex-shrink:0;transition:color 0.15s,background 0.15s;';
+    metadataCollapseBtn.textContent = '›';
+    metadataCollapseBtn.onmouseenter = () => { metadataCollapseBtn.style.color = '#c8dff0'; metadataCollapseBtn.style.background = 'rgba(255,255,255,0.07)'; };
+    metadataCollapseBtn.onmouseleave = () => { metadataCollapseBtn.style.color = '#7a9ab8'; metadataCollapseBtn.style.background = 'none'; };
+    metadataHeader.appendChild(metadataCollapseBtn);
+
     metadataPanel.appendChild(metadataHeader);
-    
+
     const metadataContent = document.createElement('div');
     metadataContent.style.cssText = 'flex:1;overflow-y:auto;padding:10px 12px;font-size:12px;';
     metadataPanel.appendChild(metadataContent);
-    
+
+    // ── Collapsed-state tab (vertical label on the left edge of the panel) ──
+    const metadataTab = document.createElement('div');
+    metadataTab.style.cssText = 'display:none;position:absolute;right:0;top:50%;transform:translateY(-50%);writing-mode:vertical-rl;text-orientation:mixed;background:#161d27;border:1px solid #2e3d4e;border-right:none;border-radius:6px 0 0 6px;padding:10px 5px;color:#7a9ab8;font-size:11px;font-weight:700;text-transform:uppercase;cursor:pointer;user-select:none;letter-spacing:0.08em;transition:color 0.15s,background 0.15s;';
+    metadataTab.textContent = '📋 Metadata';
+    metadataTab.title = 'Expand metadata panel';
+    metadataTab.onmouseenter = () => { metadataTab.style.color = '#c8dff0'; metadataTab.style.background = '#1e2a38'; };
+    metadataTab.onmouseleave = () => { metadataTab.style.color = '#7a9ab8'; metadataTab.style.background = '#161d27'; };
+
+    // mainContent needs position:relative for the tab absolute positioning
+    mainContent.style.position = 'relative';
+
+    const _toggleMetadataPanel = () => {
+        _metadataPanelCollapsed = !_metadataPanelCollapsed;
+        saveUIState({ metadataCollapsed: _metadataPanelCollapsed });
+        if (_metadataPanelCollapsed) {
+            metadataPanel.style.width = '0px';
+            metadataPanel.style.borderLeftWidth = '0px';
+            metadataCollapseBtn.textContent = '‹';
+            metadataCollapseBtn.title = 'Expand metadata panel';
+            metadataContent.style.display = 'none';
+            metadataHeaderLabel.style.display = 'none';
+            metadataCollapseBtn.style.display = 'none';
+            metadataTab.style.display = 'block';
+        } else {
+            metadataPanel.style.width = METADATA_PANEL_W + 'px';
+            metadataPanel.style.borderLeftWidth = '1px';
+            metadataCollapseBtn.textContent = '›';
+            metadataCollapseBtn.title = 'Collapse metadata panel';
+            metadataContent.style.display = '';
+            metadataHeaderLabel.style.display = '';
+            metadataCollapseBtn.style.display = '';
+            metadataTab.style.display = 'none';
+        }
+    };
+
+    metadataCollapseBtn.onclick = (e) => { e.stopPropagation(); _toggleMetadataPanel(); };
+    metadataTab.onclick = () => _toggleMetadataPanel();
+
+    // Apply saved collapsed state immediately (no animation on open)
+    if (_metadataPanelCollapsed) {
+        metadataPanel.style.transition = 'none';
+        metadataPanel.style.width = '0px';
+        metadataPanel.style.borderLeftWidth = '0px';
+        metadataCollapseBtn.textContent = '‹';
+        metadataCollapseBtn.title = 'Expand metadata panel';
+        metadataContent.style.display = 'none';
+        metadataHeaderLabel.style.display = 'none';
+        metadataCollapseBtn.style.display = 'none';
+        metadataTab.style.display = 'block';
+        // Re-enable transition after first paint
+        requestAnimationFrame(() => { metadataPanel.style.transition = 'width 0.2s ease'; });
+    }
+
     mainContent.appendChild(metadataPanel);
+    mainContent.appendChild(metadataTab);
     modal.appendChild(mainContent);
 
     // Footer
@@ -571,6 +707,8 @@ async function createFileBrowserModal(currentFile, onSelect) {
     let currentPath = null;
     let selectedPath = (currentFile && isAbsolutePath(currentFile)) ? currentFile : null;
     let currentBrowseData = null;
+    // Track whether the last navigation came from a bookmark click (hides subdirs in middle panel)
+    let _navigatedFromBookmark = false;
     if (selectedPath) { selectBtn.disabled = false; selectBtn.style.opacity = '1'; }
 
     // ─── Metadata Extraction Functions ───
@@ -1027,8 +1165,9 @@ async function createFileBrowserModal(currentFile, onSelect) {
         
         console.log("[MetaPromptExtractor] File browser: found", filteredImageFiles.length, "filtered images and", filteredOtherFiles.length, "filtered other files");
         
-        // Render directories first
-        for (const entry of filteredOtherFiles.filter(e => e.type === 'dir')) {
+        // Render directories first — hidden when navigated from a bookmark
+        // (subfolders are shown in the left panel instead)
+        for (const entry of _navigatedFromBookmark ? [] : filteredOtherFiles.filter(e => e.type === 'dir')) {
             const row = document.createElement('div');
             row.style.cssText = `display:flex;align-items:center;gap:8px;padding:6px 14px;cursor:pointer;user-select:none;`;
             row.onmouseenter = () => { row.style.background = 'rgba(255,255,255,0.04)'; };
@@ -1126,23 +1265,62 @@ async function createFileBrowserModal(currentFile, onSelect) {
             listContainer.appendChild(row);
         }
         
-        // Render images as thumbnails with preview
+        // Render images as thumbnails with lazy loading via IntersectionObserver.
+        // DOM wrappers for ALL images are created immediately (so the grid has
+        // the correct height/scrollbar), but img.src is only set once a wrapper
+        // scrolls into the viewport — the browser never issues a network request
+        // for images that are off-screen.
         if (filteredImageFiles.length > 0) {
-            console.log("[MetaPromptExtractor] Rendering", filteredImageFiles.length, "image thumbnails");
             const sortMethod = sortSelect.value;
             const sortedImageFiles = sortImages(filteredImageFiles, sortMethod);
             const colsPerRow = parseInt(sizeSlider.value);
             const imageGridContainer = document.createElement('div');
             imageGridContainer.style.cssText = `display:grid;grid-template-columns:repeat(${colsPerRow}, 1fr);gap:10px;padding:10px;`;
-            
+
+            // One shared observer for this render pass; disconnected when the
+            // grid is removed from the DOM (i.e. on next navigate / renderDir).
+            const lazyObserver = new IntersectionObserver((entries, obs) => {
+                for (const oe of entries) {
+                    if (!oe.isIntersecting) continue;
+                    const wrapper = oe.target;
+                    const url = wrapper.dataset.lazyUrl;
+                    if (!url) { obs.unobserve(wrapper); continue; }
+                    delete wrapper.dataset.lazyUrl; // mark as triggered
+                    obs.unobserve(wrapper);
+
+                    const img = wrapper._lazyImg;
+                    if (!img) continue;
+
+                    img.src = url;
+                    img.onerror = () => {
+                        wrapper.innerHTML = '<span style="font-size:40px;color:#7a9ab8;text-align:center;">📄</span>';
+                        // Re-append nameLabel which was cleared by innerHTML
+                        if (wrapper._nameLabel) wrapper.appendChild(wrapper._nameLabel);
+                        if (wrapper._infoOverlay) wrapper.appendChild(wrapper._infoOverlay);
+                    };
+                    img.onload = () => {
+                        const width = img.naturalWidth;
+                        const height = img.naturalHeight;
+                        if (wrapper._entry) { wrapper._entry.width = width; wrapper._entry.height = height; }
+                        if (width && height) {
+                            const dimLabel = document.createElement('div');
+                            dimLabel.style.cssText = 'position:absolute;top:0;left:0;right:0;background:rgba(0,0,0,0.7);color:#a8dff0;font-size:10px;padding:3px;text-align:center;font-weight:600;font-family:monospace;';
+                            dimLabel.textContent = `${width}×${height}`;
+                            wrapper.appendChild(dimLabel);
+                        }
+                    };
+                }
+            }, {
+                root: listContainer,   // observe within the scrollable panel
+                rootMargin: '200px',   // start loading 200 px before entering view
+                threshold: 0
+            });
+
             for (const entry of sortedImageFiles) {
                 const isSelected = entry.path === selectedPath;
                 const imgWrapper = document.createElement('div');
                 imgWrapper.style.cssText = `position:relative;aspect-ratio:1;border:2px solid ${isSelected?'#2a6ea6':'#3a4a5a'};border-radius:6px;overflow:hidden;cursor:pointer;background:#111820;flex-direction:column;display:flex;align-items:center;justify-content:center;`;
-                
-                const img = document.createElement('img');
-                img.style.cssText = 'max-width:100%;max-height:100%;object-fit:contain;';
-                
+
                 // Build preview URL
                 let previewUrl = '';
                 if (isAbsolutePath(entry.path)) {
@@ -1154,67 +1332,43 @@ async function createFileBrowserModal(currentFile, onSelect) {
                     previewUrl = `/view?filename=${encodeURIComponent(filename)}&type=input`;
                     if (subfolder) previewUrl += `&subfolder=${encodeURIComponent(subfolder)}`;
                 }
-                
-                console.log("[MetaPromptExtractor] Loading image thumbnail:", entry.name, "URL:", previewUrl);
-                
-                img.src = previewUrl;
-                img.onerror = () => {
-                    console.warn("[MetaPromptExtractor] Failed to load thumbnail:", entry.name, "from", previewUrl);
-                    imgWrapper.innerHTML = '<span style="font-size:40px;color:#7a9ab8;text-align:center;">📄</span>';
-                };
-                img.onload = () => {
-                    console.log("[MetaPromptExtractor] Successfully loaded thumbnail:", entry.name);
-                    // Extract and display image dimensions
-                    const width = img.naturalWidth;
-                    const height = img.naturalHeight;
-                    // Store dimensions on entry for sorting purposes
-                    entry.width = width;
-                    entry.height = height;
-                    if (width && height) {
-                        const dimensionsLabel = document.createElement('div');
-                        dimensionsLabel.style.cssText = 'position:absolute;top:0;left:0;right:0;background:rgba(0,0,0,0.7);color:#a8dff0;font-size:10px;padding:3px;text-align:center;font-weight:600;font-family:monospace;';
-                        dimensionsLabel.textContent = `${width}×${height}`;
-                        imgWrapper.appendChild(dimensionsLabel);
-                    }
-                };
-                
+
+                // Create img element but do NOT set src yet
+                const img = document.createElement('img');
+                img.style.cssText = 'max-width:100%;max-height:100%;object-fit:contain;';
                 imgWrapper.appendChild(img);
-                
-                // Add filename label at bottom with metadata indicator
+
+                // Filename label
                 const nameLabel = document.createElement('div');
                 nameLabel.style.cssText = 'position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.6);color:#c8dff0;font-size:10px;padding:3px 4px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
-                
-                let labelText = entry.name;
-                if (entry.has_metadata) {
-                    labelText = '📋 ' + labelText;
-                }
-                
-                nameLabel.textContent = labelText;
+                nameLabel.textContent = entry.has_metadata ? '📋 ' + entry.name : entry.name;
                 nameLabel.title = entry.name;
                 imgWrapper.appendChild(nameLabel);
-                
-                // Add file info overlay (size, date) - shown on hover
+
+                // Hover info overlay
                 const infoOverlay = document.createElement('div');
                 infoOverlay.style.cssText = 'position:absolute;inset:0;background:rgba(0,0,0,0.8);color:#a8dff0;font-size:9px;padding:6px;opacity:0;display:flex;align-items:flex-end;justify-content:center;text-align:center;line-height:1.3;transition:opacity 0.2s;';
-                
                 let infoText = [];
                 if (entry.size !== undefined) {
-                    const sizeStr = entry.size < 1024 ? entry.size + 'B' :
-                                   entry.size < 1024*1024 ? (entry.size/1024).toFixed(1) + 'KB' :
-                                   (entry.size/(1024*1024)).toFixed(1) + 'MB';
-                    infoText.push(sizeStr);
+                    infoText.push(entry.size < 1024 ? entry.size + 'B' :
+                                  entry.size < 1048576 ? (entry.size/1024).toFixed(1) + 'KB' :
+                                  (entry.size/1048576).toFixed(1) + 'MB');
                 }
                 if (entry.mtime) {
-                    const date = new Date(entry.mtime * 1000);
-                    infoText.push(date.toLocaleDateString('en-US', {month: 'short', day: 'numeric'}));
+                    infoText.push(new Date(entry.mtime * 1000).toLocaleDateString('en-US', {month:'short', day:'numeric'}));
                 }
                 infoOverlay.textContent = infoText.join(' • ');
-                
                 imgWrapper.appendChild(infoOverlay);
-                
+
+                // Stash references needed by the observer callback
+                imgWrapper._lazyImg    = img;
+                imgWrapper._entry      = entry;
+                imgWrapper._nameLabel  = nameLabel;
+                imgWrapper._infoOverlay = infoOverlay;
+                imgWrapper.dataset.lazyUrl = previewUrl;
+
                 imgWrapper.onmouseenter = () => { infoOverlay.style.opacity = '1'; };
                 imgWrapper.onmouseleave = () => { infoOverlay.style.opacity = '0'; };
-                
                 imgWrapper.onclick = () => {
                     selectedPath = entry.path;
                     selectedLabel.textContent = `Selected: ${entry.path}`;
@@ -1224,26 +1378,50 @@ async function createFileBrowserModal(currentFile, onSelect) {
                 };
                 imgWrapper.ondblclick = () => { selectedPath = entry.path; cleanup(); onSelect(selectedPath); };
                 imgWrapper.oncontextmenu = (e) => showContextMenu(e, entry.path, false, getBookmarks, addBookmark, removeBookmark, renderBookmarks);
-                
+
                 imageGridContainer.appendChild(imgWrapper);
+                lazyObserver.observe(imgWrapper);
             }
-            
+
             listContainer.appendChild(imageGridContainer);
+
+            // Clean up the observer when this grid is replaced by the next renderDir call.
+            // We watch for the grid's removal from the DOM using a MutationObserver.
+            const cleanupObs = new MutationObserver(() => {
+                if (!imageGridContainer.isConnected) {
+                    lazyObserver.disconnect();
+                    cleanupObs.disconnect();
+                }
+            });
+            cleanupObs.observe(listContainer, { childList: true });
         }
     };
 
-    const navigate = async (path) => {
+
+    const navigate = async (path, fromBookmark = false) => {
+        _navigatedFromBookmark = fromBookmark;
         setLoading();
         // Clear filter when navigating to a new directory
         searchInput.value = '';
         currentFilter = '';
         searchResultsLabel.textContent = '';
         cachedMetadata = {}; // Clear metadata cache
+
+        // Abort any previous in-flight navigate so stale responses never
+        // overwrite a newer navigation that already completed.
+        if (navigate._abortCtrl) navigate._abortCtrl.abort();
+        const ctrl = new AbortController();
+        navigate._abortCtrl = ctrl;
+
         try {
-            const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(path)}`);
+            const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(path)}`, { signal: ctrl.signal });
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const data = await resp.json();
             if (data.error) throw new Error(data.error);
+
+            // If we were superseded by a newer navigate call, silently discard
+            if (ctrl.signal.aborted) return;
+
             currentPath = data.current;
             pathInput.value = currentPath;
             renderBreadcrumbs(currentPath);
@@ -1255,21 +1433,196 @@ async function createFileBrowserModal(currentFile, onSelect) {
             starBtn.style.background = isBookmarked ? '#3a5a70' : '#253040';
             renderDir(data);
             renderBookmarks();
+            _scrollToActiveFolder();
             // Remember last browsed directory
-            try {
-                localStorage.setItem('metaPromptExtractor_lastBrowsedPath', currentPath);
-            } catch (e) {
-                console.warn("[MetaPromptExtractor] Failed to save last browsed path:", e);
-            }
+            saveUIState({ lastBrowsedPath: currentPath });
         } catch (e) {
+            if (e.name === 'AbortError') return; // superseded — ignore silently
             listContainer.innerHTML = `<div style="color:#e07070;font-size:13px;padding:16px;">${e.message}</div>`;
         }
     };
     
+    // ─── Subfolder expand state: path → { expanded: bool, subfolders: [{name,path}]|null }
+    // `expanded` flags are persisted to uiState.expandedPaths (a plain string[]) so the
+    // tree is restored exactly as the user left it when they close and reopen the modal.
+    // `subfolders` and `hasChildren` are always re-fetched fresh — never persisted.
+    const _persistedExpanded = new Set(
+        Array.isArray(_uiState.expandedPaths) ? _uiState.expandedPaths : []
+    );
+    const _bookmarkExpandState = {};
+
+    // Write the current set of expanded paths back to uiState
+    const _saveExpandState = () => {
+        const expanded = Object.entries(_bookmarkExpandState)
+            .filter(([, s]) => s.expanded)
+            .map(([path]) => path);
+        saveUIState({ expandedPaths: expanded });
+    };
+
+    // Fetch immediate subdirectories of a path (returns array of {name, path} or [])
+    // Calls are serialised through a simple queue so that restoring a deep saved tree
+    // on open never fires dozens of concurrent /browse requests against the HDD at once.
+    const _fetchSubfolders = (() => {
+        let _queue = Promise.resolve();
+        return (path) => {
+            const task = _queue.then(async () => {
+                try {
+                    const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(path)}`);
+                    if (!resp.ok) return [];
+                    const data = await resp.json();
+                    if (!data.entries) return [];
+                    return data.entries
+                        .filter(e => e.type === 'dir')
+                        .map(e => ({ name: e.name, path: e.path }));
+                } catch (e) {
+                    return [];
+                }
+            });
+            _queue = task.then(() => {}, () => {}); // keep chain alive even on error
+            return task;
+        };
+    })();
+
+    // Recursively render a folder row (bookmark root or any subfolder) at a given indent depth
+    const _renderFolderRow = (container, folderPath, folderName, depth, isBookmarkRoot) => {
+        const stateKey = folderPath;
+        if (!_bookmarkExpandState[stateKey]) {
+            _bookmarkExpandState[stateKey] = {
+                expanded:    _persistedExpanded.has(folderPath),
+                subfolders:  null,
+                hasChildren: null
+            };
+        }
+        const state = _bookmarkExpandState[stateKey];
+
+        const isCurrentPath = folderPath === currentPath;
+        const indent = depth * 12; // px indent per level
+
+        // Wrapper for the row + its children
+        const wrapper = document.createElement('div');
+
+        // ── Row itself ──
+        const row = document.createElement('div');
+        row.style.cssText = `display:flex;align-items:center;gap:4px;padding:9px 6px 9px ${8 + indent}px;margin:1px 4px;cursor:pointer;user-select:none;background:${isCurrentPath?'rgba(42,110,166,0.35)':'transparent'};border-radius:4px;border-left:3px solid ${isCurrentPath?'#2a6ea6':'transparent'};transition:background 0.15s;`;
+        if (isCurrentPath) row.dataset.activeFolder = '1';
+
+        // Expand arrow placeholder (always reserve space for alignment)
+        const arrowBtn = document.createElement('span');
+        arrowBtn.style.cssText = 'font-size:14px;color:#7a9ab8;cursor:pointer;flex-shrink:0;width:16px;text-align:center;line-height:1;user-select:none;';
+        arrowBtn.textContent = ''; // filled in after we know if there are children
+        row.appendChild(arrowBtn);
+
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = folderName;
+        nameSpan.style.cssText = `flex:1;font-size:14px;color:${isCurrentPath?'#c8e8ff':'#9ab8d0'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
+        row.appendChild(nameSpan);
+
+        // Remove button (only on bookmark roots)
+        if (isBookmarkRoot) {
+            const removeBtn = document.createElement('button');
+            removeBtn.textContent = '✕';
+            removeBtn.style.cssText = 'background:none;border:none;color:#7a5a5a;cursor:pointer;font-size:11px;padding:2px 4px;border-radius:3px;opacity:0;transition:opacity 0.15s;flex-shrink:0;';
+            removeBtn.onclick = (e) => {
+                e.stopPropagation();
+                removeBookmark(folderPath);
+                // Remove this folder and every cached descendant from expand state
+                const prefix = folderPath.replace(/\\/g, '/');
+                for (const key of Object.keys(_bookmarkExpandState)) {
+                    if (key.replace(/\\/g, '/').startsWith(prefix)) {
+                        delete _bookmarkExpandState[key];
+                    }
+                }
+                _saveExpandState();
+                renderBookmarks();
+            };
+            row.onmouseenter = () => {
+                if (!isCurrentPath) row.style.background = 'rgba(255,255,255,0.06)';
+                removeBtn.style.opacity = '1';
+                removeBtn.style.color = '#e07070';
+            };
+            row.onmouseleave = () => {
+                if (!isCurrentPath) row.style.background = 'transparent';
+                removeBtn.style.opacity = '0';
+                removeBtn.style.color = '#7a5a5a';
+            };
+            row.appendChild(removeBtn);
+        } else {
+            row.onmouseenter = () => { if (!isCurrentPath) row.style.background = 'rgba(255,255,255,0.06)'; };
+            row.onmouseleave = () => { if (!isCurrentPath) row.style.background = 'transparent'; };
+        }
+
+        wrapper.appendChild(row);
+
+        // Children container (hidden until expanded)
+        const childrenContainer = document.createElement('div');
+        childrenContainer.style.cssText = 'display:none;';
+        wrapper.appendChild(childrenContainer);
+
+        // ── Populate arrow + children asynchronously ──
+        const refreshArrow = () => {
+            if (state.hasChildren === false) {
+                arrowBtn.textContent = '';
+                arrowBtn.style.cursor = 'default';
+            } else if (state.hasChildren === true) {
+                arrowBtn.textContent = state.expanded ? '▾' : '▸';
+                arrowBtn.style.color = '#a8c8e8';
+                arrowBtn.style.cursor = 'pointer';
+            } else {
+                arrowBtn.textContent = ''; // still loading
+            }
+            childrenContainer.style.display = (state.expanded && state.hasChildren) ? 'block' : 'none';
+        };
+
+        const buildChildren = () => {
+            childrenContainer.innerHTML = '';
+            if (state.subfolders && state.subfolders.length > 0) {
+                for (const sub of state.subfolders) {
+                    _renderFolderRow(childrenContainer, sub.path, sub.name, depth + 1, false);
+                }
+            }
+        };
+
+        // Kick off async check for children if not cached
+        if (state.hasChildren === null) {
+            _fetchSubfolders(folderPath).then(subs => {
+                state.subfolders = subs;
+                state.hasChildren = subs.length > 0;
+                refreshArrow();
+                if (state.expanded) buildChildren();
+            });
+        } else {
+            refreshArrow();
+            if (state.expanded) buildChildren();
+        }
+
+        // Arrow click: toggle expand
+        arrowBtn.onclick = async (e) => {
+            e.stopPropagation();
+            if (state.hasChildren === false) return;
+            state.expanded = !state.expanded;
+            if (state.expanded && state.subfolders === null) {
+                const subs = await _fetchSubfolders(folderPath);
+                state.subfolders = subs;
+                state.hasChildren = subs.length > 0;
+            }
+            _saveExpandState();
+            refreshArrow();
+            buildChildren();
+        };
+
+        // Row click: navigate to this folder (fromBookmark=true for roots and their children)
+        row.onclick = (e) => {
+            if (e.target === arrowBtn) return;
+            navigate(folderPath, true);
+        };
+
+        container.appendChild(wrapper);
+    };
+
     const renderBookmarks = () => {
         bookmarksList.innerHTML = '';
         const bookmarks = getBookmarks();
-        
+
         if (bookmarks.length === 0) {
             const emptyMsg = document.createElement('div');
             emptyMsg.style.cssText = 'font-size:11px;color:#5a7a98;padding:10px 8px;text-align:center;';
@@ -1277,43 +1630,73 @@ async function createFileBrowserModal(currentFile, onSelect) {
             bookmarksList.appendChild(emptyMsg);
             return;
         }
-        
+
         for (const bookmark of bookmarks) {
-            const bookmarkItem = document.createElement('div');
-            const isCurrentPath = bookmark.path === currentPath;
-            bookmarkItem.style.cssText = `display:flex;align-items:center;gap:6px;padding:8px 8px;margin:2px 4px;cursor:pointer;user-select:none;background:${isCurrentPath?'rgba(42,110,166,0.35)':'transparent'};border-radius:4px;border-left:3px solid ${isCurrentPath?'#2a6ea6':'transparent'};transition:all 0.15s;`;
-            bookmarkItem.onmouseenter = () => { if (!isCurrentPath) bookmarkItem.style.background = 'rgba(255,255,255,0.06)'; };
-            bookmarkItem.onmouseleave = () => { if (!isCurrentPath) bookmarkItem.style.background = 'transparent'; };
-            
-            const nameSpan = document.createElement('span');
-            nameSpan.textContent = bookmark.name;
-            nameSpan.style.cssText = `flex:1;font-size:12px;color:${isCurrentPath?'#9bcce8':'#7a9ab8'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
-            bookmarkItem.appendChild(nameSpan);
-            
-            const removeBtn = document.createElement('button');
-            removeBtn.textContent = '✕';
-            removeBtn.style.cssText = 'background:none;border:none;color:#7a5a5a;cursor:pointer;font-size:12px;padding:2px 4px;border-radius:3px;opacity:0;transition:opacity 0.15s;';
-            removeBtn.onclick = (e) => {
-                e.stopPropagation();
-                removeBookmark(bookmark.path);
-                renderBookmarks();
-                console.log("[MetaPromptExtractor] Removed bookmark:", bookmark.name);
-            };
-            bookmarkItem.onmouseenter = () => {
-                if (!isCurrentPath) bookmarkItem.style.background = 'rgba(255,255,255,0.06)';
-                removeBtn.style.opacity = '1';
-                removeBtn.style.color = '#e07070';
-            };
-            bookmarkItem.onmouseleave = () => {
-                if (!isCurrentPath) bookmarkItem.style.background = 'transparent';
-                removeBtn.style.opacity = '0';
-                removeBtn.style.color = '#7a5a5a';
-            };
-            bookmarkItem.appendChild(removeBtn);
-            
-            bookmarkItem.onclick = () => navigate(bookmark.path);
-            bookmarksList.appendChild(bookmarkItem);
+            _renderFolderRow(bookmarksList, bookmark.path, bookmark.name, 0, true);
         }
+    };
+
+    // Scroll bookmarksList so the active folder row is visible — precisely, with no overshoot.
+    //
+    // WHY NOT scrollIntoView: it scrolls every scrollable ancestor simultaneously
+    // (sidebar, page body…), causing them to fight and overshoot.
+    //
+    // WHY NOT offsetTop chain walk: bookmarksList is position:static so it never
+    // appears in the offsetParent chain — the walk exits at sidebar instead,
+    // giving a wrong top value.
+    //
+    // CORRECT APPROACH: getBoundingClientRect() gives viewport-relative coords for
+    // both the element and the container; their difference is the true visible offset
+    // regardless of CSS positioning. Combine with scrollTop to get the absolute
+    // offset inside the scrollable container, then clamp so the row is fully visible.
+    const _scrollSidebarToEl = (el) => {
+        const elRect   = el.getBoundingClientRect();
+        const listRect = bookmarksList.getBoundingClientRect();
+        // Position of el's top edge relative to the top of bookmarksList's content area
+        const relTop   = elRect.top - listRect.top + bookmarksList.scrollTop;
+        const elH      = el.offsetHeight;
+        const listH    = bookmarksList.clientHeight;
+        const cur      = bookmarksList.scrollTop;
+        const MARGIN   = 8;
+
+        if (relTop - MARGIN < cur) {
+            // Row is above visible area — scroll up to show it with a small margin
+            bookmarksList.scrollTop = Math.max(0, relTop - MARGIN);
+        } else if (relTop + elH + MARGIN > cur + listH) {
+            // Row is below visible area — scroll down just enough to show it
+            bookmarksList.scrollTop = relTop + elH + MARGIN - listH;
+        }
+        // Already fully visible — do nothing
+    };
+
+    const _scrollToActiveFolder = () => {
+        // Immediately check — row may already be in the DOM if tree was cached
+        const existing = bookmarksList.querySelector('[data-active-folder]');
+        if (existing) {
+            _scrollSidebarToEl(existing);
+            return;
+        }
+
+        // The active row doesn't exist yet — it appears only after async
+        // _fetchSubfolders calls resolve level by level down the tree.
+        // On large HDD folders (87k files) a single fetch can take >1 s, and
+        // a 3-level deep path needs 3 sequential fetches.  We must wait long
+        // enough for all of them to complete before giving up.
+        // Timeout = 30 s (generous for slow HDDs) — the observer auto-disconnects
+        // the moment the row is found, so there is no real cost to being generous.
+        let timer = null;
+        const obs = new MutationObserver(() => {
+            const el = bookmarksList.querySelector('[data-active-folder]');
+            if (!el) return;            // not yet — keep watching
+            // Found — disconnect FIRST so no further mutations re-trigger this
+            obs.disconnect();
+            clearTimeout(timer);
+            // Defer by one rAF so the browser has finished painting the new rows
+            // before we measure their dimensions with getBoundingClientRect()
+            requestAnimationFrame(() => _scrollSidebarToEl(el));
+        });
+        obs.observe(bookmarksList, { childList: true, subtree: true });
+        timer = setTimeout(() => obs.disconnect(), 30000);
     };
 
     const showRoots = async () => {
@@ -1400,14 +1783,9 @@ async function createFileBrowserModal(currentFile, onSelect) {
     // Start navigation
     let startPath = null;
     
-    // Try to restore last browsed directory
-    try {
-        const lastPath = localStorage.getItem('metaPromptExtractor_lastBrowsedPath');
-        if (lastPath) {
-            startPath = lastPath;
-        }
-    } catch (e) {
-        console.warn("[MetaPromptExtractor] Failed to load last browsed path:", e);
+    // Restore last browsed directory from saved UI state
+    if (_uiState.lastBrowsedPath) {
+        startPath = _uiState.lastBrowsedPath;
     }
     
     if (!startPath && currentFile && isAbsolutePath(currentFile)) {

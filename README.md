@@ -41,6 +41,13 @@ This node works differently:
 
 3. **No additional dependencies needed** — Uses only standard ComfyUI libraries (PIL, torch, numpy)
 
+## Update 1.7.0
+
+- Browse Files floating window now remembers previous state before closing. 
+- Favorites panel is now resizable (right-left).
+- Metadata panel is now collapsible.
+- Reopening the Browse Files floating window now scrolls to the last selected folder/subfolder.
+
 ## Update 1.6.0
 
 - Browse Files floating window now detached and resizable. 
