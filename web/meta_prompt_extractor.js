@@ -41,6 +41,638 @@ function _fileIcon(ext) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Folder Picker Dialog — used by Copy/Move context menu items instead of prompt()
+// Returns a Promise<string|null> that resolves with the chosen folder path or
+// null if the user cancelled.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _openFolderPickerDialog(title = 'Select a folder') {
+    return new Promise((resolve) => {
+
+        // ── Inject scoped styles once ──────────────────────────────────────────
+        if (!document.getElementById('_mpe_fpd_style')) {
+            const s = document.createElement('style');
+            s.id = '_mpe_fpd_style';
+            s.textContent = `
+                .mpe-fpd-row {
+                    display:flex;align-items:center;gap:7px;padding:5px 10px;
+                    cursor:pointer;user-select:none;border-radius:4px;
+                    font-family:sans-serif;font-size:13px;color:#c8dff0;
+                    white-space:nowrap;overflow:hidden;
+                }
+                .mpe-fpd-row:hover  { background:rgba(255,255,255,0.06); }
+                .mpe-fpd-row.active { background:rgba(42,110,166,0.40);color:#e8f4ff; }
+                .mpe-fpd-arrow {
+                    display:inline-block;width:14px;text-align:center;
+                    font-size:11px;color:#7a9ab8;flex-shrink:0;transition:transform 0.12s;
+                }
+                .mpe-fpd-arrow.open { transform:rotate(90deg); }
+                .mpe-fpd-icon  { font-size:15px;flex-shrink:0; }
+                .mpe-fpd-label { flex:1;overflow:hidden;text-overflow:ellipsis; }
+                .mpe-fpd-children { padding-left:18px; }
+                .mpe-fpd-divider {
+                    height:1px;background:#2e3d4e;margin:5px 8px;
+                }
+                .mpe-fpd-section-hdr {
+                    font-size:10px;font-weight:700;color:#5a7a98;text-transform:uppercase;
+                    padding:8px 10px 3px;letter-spacing:0.06em;font-family:sans-serif;
+                }
+                .mpe-fpd-crumb {
+                    display:inline-flex;align-items:center;padding:3px 8px;border-radius:4px;
+                    font-size:12px;cursor:pointer;color:#9bcce8;white-space:nowrap;
+                    transition:background 0.12s;
+                }
+                .mpe-fpd-crumb:hover     { background:rgba(255,255,255,0.08); }
+                .mpe-fpd-crumb.last      { color:#c8dff0;cursor:default;background:rgba(42,110,166,0.22); }
+                .mpe-fpd-crumb-sep       { color:#5a7a98;font-size:14px;padding:0 1px; }
+                .mpe-fpd-navbtn {
+                    background:#253040;border:1px solid #3a4a5a;border-radius:5px;
+                    color:#9ab8d0;padding:4px 9px;font-size:13px;cursor:pointer;
+                    transition:background 0.12s;flex-shrink:0;
+                }
+                .mpe-fpd-navbtn:hover    { background:#2e3d4e; }
+                .mpe-fpd-navbtn:disabled { opacity:0.35;cursor:default; }
+                .mpe-fpd-main-row {
+                    display:flex;align-items:center;gap:7px;padding:5px 12px;
+                    cursor:pointer;user-select:none;font-family:sans-serif;
+                    font-size:13px;color:#c8dff0;border-radius:4px;margin:1px 4px;
+                }
+                .mpe-fpd-main-row:hover  { background:rgba(255,255,255,0.05); }
+                .mpe-fpd-main-row.active { background:rgba(42,110,166,0.38);color:#e8f4ff; }
+            `;
+            document.head.appendChild(s);
+        }
+
+        // ── Overlay + modal ────────────────────────────────────────────────────
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:10100;display:flex;align-items:center;justify-content:center;';
+
+        const modal = document.createElement('div');
+        modal.style.cssText = [
+            'background:#1e2530;border:1px solid #3a4a5a;border-radius:10px;',
+            'display:flex;flex-direction:column;',
+            'box-shadow:0 16px 56px rgba(0,0,0,0.8);font-family:sans-serif;',
+            'overflow:hidden;z-index:10101;',
+            'width:760px;max-width:96vw;height:520px;max-height:92vh;',
+            'box-sizing:border-box;position:relative;'
+        ].join('');
+        overlay.appendChild(modal);
+
+        // ── Title bar ──────────────────────────────────────────────────────────
+        const titleBar = document.createElement('div');
+        titleBar.style.cssText = 'display:flex;align-items:center;gap:8px;padding:9px 14px;background:#161d27;border-bottom:1px solid #2e3d4e;flex-shrink:0;';
+        const titleSpan = document.createElement('span');
+        titleSpan.textContent = '📂 ' + title;
+        titleSpan.style.cssText = 'color:#d0e4f4;font-size:14px;font-weight:700;flex:1;';
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = '✕';
+        closeBtn.style.cssText = 'background:none;border:none;color:#8aaccc;font-size:16px;cursor:pointer;padding:2px 6px;border-radius:4px;line-height:1;';
+        closeBtn.onclick = () => done(null);
+        titleBar.appendChild(titleSpan);
+        titleBar.appendChild(closeBtn);
+        modal.appendChild(titleBar);
+
+        // ── Toolbar: back / forward / up / breadcrumbs / path input ───────────
+        const toolbar = document.createElement('div');
+        toolbar.style.cssText = 'display:flex;align-items:center;gap:5px;padding:6px 10px;background:#1a2232;border-bottom:1px solid #2e3d4e;flex-shrink:0;';
+
+        const mkNavBtn = (label, tip) => {
+            const b = document.createElement('button');
+            b.className = 'mpe-fpd-navbtn';
+            b.textContent = label;
+            b.title = tip;
+            b.disabled = true;
+            return b;
+        };
+        const backBtn    = mkNavBtn('◀', 'Back');
+        const fwdBtn     = mkNavBtn('▶', 'Forward');
+        const upBtn      = mkNavBtn('⬆', 'Up one level');
+        const drivesBtn  = mkNavBtn('💾', 'Browse drives / root');
+
+        // Breadcrumb strip (hides when path-input is focused)
+        const breadcrumbWrap = document.createElement('div');
+        breadcrumbWrap.style.cssText = 'flex:1;display:flex;align-items:center;gap:1px;overflow:hidden;background:#111820;border:1px solid #3a4a5a;border-radius:5px;padding:2px 6px;min-width:0;cursor:text;height:28px;box-sizing:border-box;';
+
+        const pathInput = document.createElement('input');
+        pathInput.type = 'text';
+        pathInput.placeholder = 'Type a path and press Enter…';
+        pathInput.style.cssText = 'flex:1;background:#111820;border:1px solid #3a4a5a;border-radius:5px;color:#c8dff0;padding:4px 9px;font-size:12px;outline:none;height:28px;box-sizing:border-box;display:none;';
+
+        toolbar.appendChild(backBtn);
+        toolbar.appendChild(fwdBtn);
+        toolbar.appendChild(upBtn);
+        toolbar.appendChild(drivesBtn);
+        toolbar.appendChild(breadcrumbWrap);
+        toolbar.appendChild(pathInput);
+        modal.appendChild(toolbar);
+
+        // Click on breadcrumb strip → switch to editable input
+        breadcrumbWrap.addEventListener('click', () => {
+            breadcrumbWrap.style.display = 'none';
+            pathInput.style.display = '';
+            pathInput.value = currentPath || '';
+            pathInput.focus();
+            pathInput.select();
+        });
+        pathInput.addEventListener('blur', () => {
+            pathInput.style.display = 'none';
+            breadcrumbWrap.style.display = '';
+        });
+        pathInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                const v = pathInput.value.trim();
+                if (v) navigateTo(v);
+                pathInput.blur();
+            } else if (e.key === 'Escape') {
+                pathInput.blur();
+            }
+        });
+
+        // ── Body: left sidebar + right folder list ─────────────────────────────
+        const body = document.createElement('div');
+        body.style.cssText = 'display:flex;flex:1;min-height:0;';
+        modal.appendChild(body);
+
+        // ── Left sidebar ───────────────────────────────────────────────────────
+        const sidebar = document.createElement('div');
+        sidebar.style.cssText = 'width:190px;min-width:140px;max-width:260px;background:#161d27;border-right:1px solid #2e3d4e;overflow-y:auto;flex-shrink:0;padding:6px 0;';
+        body.appendChild(sidebar);
+
+        // ── Right folder-content panel ─────────────────────────────────────────
+        const mainPanel = document.createElement('div');
+        mainPanel.style.cssText = 'flex:1;overflow-y:auto;padding:6px 4px;min-width:0;';
+        body.appendChild(mainPanel);
+
+        // ── Footer ─────────────────────────────────────────────────────────────
+        const footer = document.createElement('div');
+        footer.style.cssText = 'display:flex;align-items:center;gap:10px;padding:9px 14px;background:#161d27;border-top:1px solid #2e3d4e;flex-shrink:0;';
+        const selLabel = document.createElement('span');
+        selLabel.style.cssText = 'flex:1;color:#7a9ab8;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-style:italic;';
+        selLabel.textContent = 'Navigate to a folder, then click "Select Folder"';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.style.cssText = 'background:#2a3040;border:1px solid #3a4a5a;border-radius:6px;color:#9ab8d0;padding:7px 18px;font-size:13px;cursor:pointer;';
+        const selectBtn = document.createElement('button');
+        selectBtn.textContent = 'Select Folder';
+        selectBtn.style.cssText = 'background:#2a6ea6;border:none;border-radius:6px;color:#fff;padding:7px 22px;font-size:13px;cursor:pointer;font-weight:700;letter-spacing:0.02em;';
+        cancelBtn.onclick = () => done(null);
+        selectBtn.onclick = () => { if (currentPath) done(currentPath); };
+        footer.appendChild(selLabel);
+        footer.appendChild(cancelBtn);
+        footer.appendChild(selectBtn);
+        modal.appendChild(footer);
+
+        document.body.appendChild(overlay);
+
+        // ── State ──────────────────────────────────────────────────────────────
+        let currentPath    = null;
+        let parentPath     = null;
+        let historyStack   = [];   // paths navigated backward from
+        let futureStack    = [];   // paths available to go forward to
+        let quickAccessItems = []; // loaded once: home, desktop, common dirs
+        let drives         = [];   // loaded once from /list-roots
+
+        // ── Cleanup & resolve ──────────────────────────────────────────────────
+        const done = (result) => {
+            document.removeEventListener('keydown', onEsc);
+            overlay.remove();
+            resolve(result);
+        };
+        const onEsc = (e) => { if (e.key === 'Escape') done(null); };
+        document.addEventListener('keydown', onEsc);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) done(null); });
+
+        // ── Breadcrumb renderer ────────────────────────────────────────────────
+        const renderBreadcrumbs = (path) => {
+            breadcrumbWrap.innerHTML = '';
+            if (!path) return;
+            const norm = path.replace(/\\/g, '/');
+            // Detect Windows drive root like C:
+            const driveMatch = norm.match(/^([A-Za-z]:)(\/.*)?$/);
+            let segments = [];
+            let rootLabel = '';
+            let rootPath  = '';
+
+            if (driveMatch) {
+                rootLabel = driveMatch[1].toUpperCase();
+                rootPath  = driveMatch[1];
+                const rest = (driveMatch[2] || '').replace(/^\//, '');
+                segments = rest ? rest.split('/').filter(Boolean) : [];
+            } else if (norm.startsWith('/')) {
+                rootLabel = '/';
+                rootPath  = '/';
+                segments = norm.replace(/^\//, '').split('/').filter(Boolean);
+            } else {
+                // Relative — just show the whole thing as one segment
+                const crumb = document.createElement('span');
+                crumb.className = 'mpe-fpd-crumb last';
+                crumb.textContent = path;
+                breadcrumbWrap.appendChild(crumb);
+                return;
+            }
+
+            const mkCrumb = (label, targetPath, isLast) => {
+                const c = document.createElement('span');
+                c.className = 'mpe-fpd-crumb' + (isLast ? ' last' : '');
+                c.textContent = label;
+                if (!isLast) c.addEventListener('click', (e) => { e.stopPropagation(); navigateTo(targetPath); });
+                return c;
+            };
+
+            breadcrumbWrap.appendChild(mkCrumb(rootLabel, rootPath, segments.length === 0));
+
+            let built = rootPath;
+            segments.forEach((seg, i) => {
+                const sep = document.createElement('span');
+                sep.className = 'mpe-fpd-crumb-sep';
+                sep.textContent = '›';
+                breadcrumbWrap.appendChild(sep);
+                built = built.replace(/\/$/, '') + '/' + seg;
+                breadcrumbWrap.appendChild(mkCrumb(seg, built, i === segments.length - 1));
+            });
+        };
+
+        // ── Navigate to a path ─────────────────────────────────────────────────
+        const navigateTo = async (path, pushHistory = true) => {
+            mainPanel.innerHTML = '<div style="color:#7a9ab8;font-size:13px;padding:24px;text-align:center;">Loading…</div>';
+            try {
+                const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(path)}`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+
+                if (pushHistory && currentPath && currentPath !== data.current) {
+                    historyStack.push(currentPath);
+                    futureStack = [];
+                }
+
+                currentPath = data.current;
+                parentPath  = data.parent || null;
+
+                // Update nav buttons
+                backBtn.disabled  = historyStack.length === 0;
+                fwdBtn.disabled   = futureStack.length  === 0;
+                upBtn.disabled    = !parentPath;
+
+                renderBreadcrumbs(currentPath);
+                selLabel.textContent = currentPath;
+                selLabel.style.fontStyle = 'normal';
+                selLabel.style.color = '#a8dff0';
+
+                renderMainPanel(data.entries || []);
+                highlightSidebar(currentPath);
+            } catch (err) {
+                mainPanel.innerHTML = `<div style="color:#e07070;font-size:13px;padding:16px;">Error: ${err.message}</div>`;
+            }
+        };
+
+        // ── Render the right folder-content panel ──────────────────────────────
+        const renderMainPanel = (entries) => {
+            mainPanel.innerHTML = '';
+            const dirs = entries.filter(e => e.type === 'dir');
+            if (dirs.length === 0) {
+                mainPanel.innerHTML = '<div style="color:#5a7a98;font-size:13px;padding:24px;text-align:center;">No sub-folders here</div>';
+                return;
+            }
+            for (const d of dirs) {
+                const row = document.createElement('div');
+                row.className = 'mpe-fpd-main-row';
+                row.dataset.path = d.path;
+
+                const arrowWrap = document.createElement('span');
+                arrowWrap.className = 'mpe-fpd-arrow';
+                arrowWrap.textContent = '▸';
+                arrowWrap.title = 'Expand';
+
+                const icon = document.createElement('span');
+                icon.className = 'mpe-fpd-icon';
+                icon.textContent = '📁';
+
+                const label = document.createElement('span');
+                label.className = 'mpe-fpd-label';
+                label.textContent = d.name;
+
+                row.appendChild(arrowWrap);
+                row.appendChild(icon);
+                row.appendChild(label);
+
+                // Inline expand: clicking the arrow opens sub-rows beneath
+                let expanded = false;
+                let childContainer = null;
+
+                arrowWrap.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    if (!expanded) {
+                        arrowWrap.className = 'mpe-fpd-arrow open';
+                        arrowWrap.textContent = '▾';
+                        icon.textContent = '📂';
+                        expanded = true;
+                        if (!childContainer) {
+                            childContainer = document.createElement('div');
+                            childContainer.style.paddingLeft = '22px';
+                            // Load sub-folders
+                            childContainer.innerHTML = '<div style="color:#5a7a98;font-size:12px;padding:4px 8px;">Loading…</div>';
+                            row.insertAdjacentElement('afterend', childContainer);
+                            try {
+                                const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(d.path)}`);
+                                const data = await resp.json();
+                                childContainer.innerHTML = '';
+                                const subs = (data.entries || []).filter(s => s.type === 'dir');
+                                if (subs.length === 0) {
+                                    childContainer.innerHTML = '<div style="color:#4a6a88;font-size:12px;padding:3px 8px;font-style:italic;">Empty</div>';
+                                } else {
+                                    for (const sub of subs) {
+                                        childContainer.appendChild(makeInlineRow(sub, 1));
+                                    }
+                                }
+                            } catch {
+                                childContainer.innerHTML = '<div style="color:#e07070;font-size:12px;padding:3px 8px;">Error loading</div>';
+                            }
+                        } else {
+                            childContainer.style.display = '';
+                        }
+                    } else {
+                        arrowWrap.className = 'mpe-fpd-arrow';
+                        arrowWrap.textContent = '▸';
+                        icon.textContent = '📁';
+                        expanded = false;
+                        if (childContainer) childContainer.style.display = 'none';
+                    }
+                });
+
+                // Single-click selects + highlights
+                row.addEventListener('click', (e) => {
+                    if (e.target === arrowWrap) return;
+                    selectRow(row, d.path);
+                });
+
+                // Double-click navigates into
+                row.addEventListener('dblclick', (e) => {
+                    if (e.target === arrowWrap) return;
+                    navigateTo(d.path);
+                });
+
+                mainPanel.appendChild(row);
+            }
+        };
+
+        // Build a nested inline sub-row (same behaviour, deeper indent)
+        const makeInlineRow = (entry, depth) => {
+            const row = document.createElement('div');
+            row.className = 'mpe-fpd-main-row';
+            row.dataset.path = entry.path;
+            row.style.paddingLeft = (12 + depth * 18) + 'px';
+
+            const arrowWrap = document.createElement('span');
+            arrowWrap.className = 'mpe-fpd-arrow';
+            arrowWrap.textContent = '▸';
+
+            const icon = document.createElement('span');
+            icon.className = 'mpe-fpd-icon';
+            icon.textContent = '📁';
+
+            const label = document.createElement('span');
+            label.className = 'mpe-fpd-label';
+            label.textContent = entry.name;
+
+            row.appendChild(arrowWrap);
+            row.appendChild(icon);
+            row.appendChild(label);
+
+            let expanded = false;
+            let childContainer = null;
+
+            arrowWrap.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                if (!expanded) {
+                    arrowWrap.className = 'mpe-fpd-arrow open';
+                    arrowWrap.textContent = '▾';
+                    icon.textContent = '📂';
+                    expanded = true;
+                    if (!childContainer) {
+                        childContainer = document.createElement('div');
+                        childContainer.innerHTML = '<div style="color:#5a7a98;font-size:12px;padding:3px 8px;">Loading…</div>';
+                        row.insertAdjacentElement('afterend', childContainer);
+                        try {
+                            const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(entry.path)}`);
+                            const data = await resp.json();
+                            childContainer.innerHTML = '';
+                            const subs = (data.entries || []).filter(s => s.type === 'dir');
+                            if (subs.length === 0) {
+                                childContainer.innerHTML = '<div style="color:#4a6a88;font-size:12px;padding:3px 8px;font-style:italic;">Empty</div>';
+                            } else {
+                                for (const sub of subs) {
+                                    childContainer.appendChild(makeInlineRow(sub, depth + 1));
+                                }
+                            }
+                        } catch {
+                            childContainer.innerHTML = '<div style="color:#e07070;font-size:12px;padding:3px 8px;">Error loading</div>';
+                        }
+                    } else {
+                        childContainer.style.display = '';
+                    }
+                } else {
+                    arrowWrap.className = 'mpe-fpd-arrow';
+                    arrowWrap.textContent = '▸';
+                    icon.textContent = '📁';
+                    expanded = false;
+                    if (childContainer) childContainer.style.display = 'none';
+                }
+            });
+
+            row.addEventListener('click', (e) => {
+                if (e.target === arrowWrap) return;
+                selectRow(row, entry.path);
+            });
+            row.addEventListener('dblclick', (e) => {
+                if (e.target === arrowWrap) return;
+                navigateTo(entry.path);
+            });
+
+            return row;
+        };
+
+        // ── Select a folder row (highlights it, updates footer, does NOT navigate) ──
+        const selectRow = (row, path) => {
+            mainPanel.querySelectorAll('.mpe-fpd-main-row.active').forEach(r => r.classList.remove('active'));
+            row.classList.add('active');
+            currentPath = path;
+            selLabel.textContent = path;
+            selLabel.style.fontStyle = 'normal';
+            selLabel.style.color = '#a8dff0';
+            renderBreadcrumbs(path);
+        };
+
+        // ── Highlight matching sidebar item ────────────────────────────────────
+        const highlightSidebar = (path) => {
+            sidebar.querySelectorAll('.mpe-fpd-row.active').forEach(r => r.classList.remove('active'));
+            const norm = (path || '').replace(/\\/g, '/').toLowerCase();
+            sidebar.querySelectorAll('.mpe-fpd-row[data-path]').forEach(r => {
+                const rp = (r.dataset.path || '').replace(/\\/g, '/').toLowerCase();
+                if (rp === norm) r.classList.add('active');
+            });
+        };
+
+        // ── Build the left sidebar ─────────────────────────────────────────────
+        const buildSidebar = async () => {
+            sidebar.innerHTML = '';
+
+            const addSection = (label) => {
+                const hdr = document.createElement('div');
+                hdr.className = 'mpe-fpd-section-hdr';
+                hdr.textContent = label;
+                sidebar.appendChild(hdr);
+            };
+
+            const addRow = (icon, label, path, onClick) => {
+                const row = document.createElement('div');
+                row.className = 'mpe-fpd-row';
+                if (path) row.dataset.path = path;
+                const ico = document.createElement('span'); ico.className = 'mpe-fpd-icon'; ico.textContent = icon;
+                const lbl = document.createElement('span'); lbl.className = 'mpe-fpd-label'; lbl.textContent = label;
+                lbl.title = path || label;
+                row.appendChild(ico); row.appendChild(lbl);
+                row.addEventListener('click', onClick || (() => { if (path) navigateTo(path); }));
+                sidebar.appendChild(row);
+                return row;
+            };
+
+            const addDivider = () => {
+                const d = document.createElement('div'); d.className = 'mpe-fpd-divider';
+                sidebar.appendChild(d);
+            };
+
+            // ── Quick Access: home directory ──
+            addSection('Quick Access');
+            try {
+                const r = await fetch('/meta-prompt-extractor/browse');
+                const d = await r.json();
+                if (d.current) {
+                    addRow('🏠', 'Home', d.current);
+                    // Try to infer Desktop / Documents / Pictures from home
+                    const home = d.current.replace(/\\/g, '/');
+                    const commonDirs = [
+                        { icon: '🖥️', name: 'Desktop',   rel: 'Desktop'   },
+                        { icon: '📄', name: 'Documents',  rel: 'Documents' },
+                        { icon: '🖼️', name: 'Pictures',   rel: 'Pictures'  },
+                        { icon: '📥', name: 'Downloads',  rel: 'Downloads' },
+                        { icon: '🎬', name: 'Videos',     rel: 'Videos'    },
+                    ];
+                    for (const cd of commonDirs) {
+                        const candidate = home.replace(/\/$/, '') + '/' + cd.rel;
+                        // Speculatively show; they'll simply show a "no subfolders" if missing
+                        addRow(cd.icon, cd.name, candidate);
+                    }
+                }
+            } catch {}
+
+            addDivider();
+
+            // ── Drives / root ──
+            addSection('This PC');
+            try {
+                const r = await fetch('/meta-prompt-extractor/list-roots');
+                const d = await r.json();
+                drives = d.roots || [];
+                for (const drv of drives) {
+                    const label = drv.length <= 3 ? drv : drv; // show as-is
+                    const icon  = drv.startsWith('/') ? '🗂️' : '💾';
+                    addRow(icon, label, drv);
+                }
+            } catch {
+                addRow('💾', 'C:\\', 'C:');
+            }
+
+            addDivider();
+
+            // ── Network / special ──
+            addSection('Other');
+            addRow('🌐', 'Network…', null, async () => {
+                // Try \\ (UNC root) or /net on Unix
+                navigateTo('//');
+            });
+            addRow('💾', 'All Drives', null, async () => {
+                // Show drives in main panel
+                mainPanel.innerHTML = '';
+                for (const drv of drives) {
+                    const icon  = drv.startsWith('/') ? '🗂️' : '💾';
+                    const row = document.createElement('div');
+                    row.className = 'mpe-fpd-main-row';
+                    row.dataset.path = drv;
+                    const ic = document.createElement('span'); ic.className = 'mpe-fpd-icon'; ic.textContent = icon;
+                    const lbl = document.createElement('span'); lbl.className = 'mpe-fpd-label'; lbl.textContent = drv;
+                    row.appendChild(ic); row.appendChild(lbl);
+                    row.addEventListener('click', () => selectRow(row, drv));
+                    row.addEventListener('dblclick', () => navigateTo(drv));
+                    mainPanel.appendChild(row);
+                }
+                currentPath = null;
+                selLabel.textContent = 'Choose a drive';
+                selLabel.style.fontStyle = 'italic';
+                selLabel.style.color = '#7a9ab8';
+                breadcrumbWrap.innerHTML = '';
+                backBtn.disabled = historyStack.length === 0;
+            });
+        };
+
+        // ── Navigation history buttons ─────────────────────────────────────────
+        backBtn.addEventListener('click', () => {
+            if (!historyStack.length) return;
+            futureStack.push(currentPath);
+            const prev = historyStack.pop();
+            navigateTo(prev, false);
+        });
+        fwdBtn.addEventListener('click', () => {
+            if (!futureStack.length) return;
+            historyStack.push(currentPath);
+            const next = futureStack.pop();
+            navigateTo(next, false);
+        });
+        upBtn.addEventListener('click', () => { if (parentPath) navigateTo(parentPath); });
+        drivesBtn.addEventListener('click', async () => {
+            // Show drives in main panel
+            if (currentPath) historyStack.push(currentPath);
+            futureStack = [];
+            mainPanel.innerHTML = '';
+            for (const drv of drives) {
+                const icon = drv.startsWith('/') ? '🗂️' : '💾';
+                const row  = document.createElement('div');
+                row.className = 'mpe-fpd-main-row';
+                row.dataset.path = drv;
+                const ic = document.createElement('span'); ic.className = 'mpe-fpd-icon'; ic.textContent = icon;
+                const lbl = document.createElement('span'); lbl.className = 'mpe-fpd-label'; lbl.textContent = drv;
+                row.appendChild(ic); row.appendChild(lbl);
+                row.addEventListener('click', () => selectRow(row, drv));
+                row.addEventListener('dblclick', () => navigateTo(drv));
+                mainPanel.appendChild(row);
+            }
+            breadcrumbWrap.innerHTML = '';
+            const allDrivesCrumb = document.createElement('span');
+            allDrivesCrumb.className = 'mpe-fpd-crumb last';
+            allDrivesCrumb.textContent = '💾 This PC';
+            breadcrumbWrap.appendChild(allDrivesCrumb);
+            currentPath = null;
+            parentPath  = null;
+            upBtn.disabled  = true;
+            backBtn.disabled = historyStack.length === 0;
+            fwdBtn.disabled  = futureStack.length  === 0;
+            selLabel.textContent = 'Select a drive to browse';
+            selLabel.style.fontStyle = 'italic';
+            selLabel.style.color = '#7a9ab8';
+            highlightSidebar('');
+        });
+
+        // ── Bootstrap ─────────────────────────────────────────────────────────
+        buildSidebar().then(() => {
+            // Start at home directory
+            fetch('/meta-prompt-extractor/browse')
+                .then(r => r.json())
+                .then(d => navigateTo(d.current, false))
+                .catch(() => navigateTo('/', false));
+        });
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Context Menu System — Right-Click Power-User Features
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -50,7 +682,7 @@ let _activeContextMenu = null; // Track active context menu to prevent duplicate
  * Create and display a context menu for files/folders
  * Features: Copy path, Open in Explorer, Add/Remove from favorites
  */
-function showContextMenu(event, filePath, isDir, getBookmarks, addBookmark, removeBookmark, renderBookmarks) {
+function showContextMenu(event, filePath, isDir, getBookmarks, addBookmark, removeBookmark, renderBookmarks, navigateCallback) {
     event.preventDefault();
     event.stopPropagation();
     
@@ -171,6 +803,99 @@ function showContextMenu(event, filePath, isDir, getBookmarks, addBookmark, remo
             renderBookmarks();
         }
     ));
+
+    // ─── File-only actions (non-directory) ───
+    if (!isDir) {
+        // Separator
+        const sep = document.createElement('div');
+        sep.style.cssText = 'height:1px;background:#2e3d4e;margin:4px 0;';
+        menu.appendChild(sep);
+
+        // Rename
+        menu.appendChild(createMenuItem('Rename', '✏️', async () => {
+            const filename = filePath.replace(/\\/g, '/').split('/').pop();
+            const newName = prompt('Enter new filename:', filename);
+            if (!newName || newName === filename) return;
+            try {
+                const res = await fetch('/meta-prompt-extractor/rename-file', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ old_path: filePath, new_name: newName })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    // Re-navigate to refresh directory listing
+                    if (navigateCallback) navigateCallback();
+                } else { alert('Rename failed: ' + (data.message || 'Unknown error')); }
+            } catch (e) { alert('Rename error: ' + e); }
+        }));
+
+        // Copy to… — opens a folder-picker dialog
+        menu.appendChild(createMenuItem('Copy to…', '📋➔', async () => {
+            const dest = await _openFolderPickerDialog('Select destination folder to copy to');
+            if (!dest) return;
+            try {
+                const res = await fetch('/meta-prompt-extractor/copy-files', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ source_paths: [filePath], destination_dir: dest })
+                });
+                const data = await res.json();
+                if (data.status === 'ok' || data.status === 'partial') {
+                    if (data.errors && data.errors.length > 0) alert('Copy errors:\n' + data.errors.join('\n'));
+                    // No navigate — source file stays where it is
+                } else { alert('Copy failed: ' + (data.message || 'Unknown error')); }
+            } catch (e) { alert('Copy error: ' + e); }
+        }));
+
+        // Move to… — opens a folder-picker dialog
+        menu.appendChild(createMenuItem('Move to…', '➔', async () => {
+            const dest = await _openFolderPickerDialog('Select destination folder to move to');
+            if (!dest) return;
+            try {
+                const res = await fetch('/meta-prompt-extractor/move-files', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ source_paths: [filePath], destination_dir: dest })
+                });
+                const data = await res.json();
+                if (data.status === 'ok' || data.status === 'partial') {
+                    if (data.errors && data.errors.length > 0) alert('Move errors:\n' + data.errors.join('\n'));
+                    if (navigateCallback) navigateCallback();  // file is gone — refresh view
+                } else { alert('Move failed: ' + (data.message || 'Unknown error')); }
+            } catch (e) { alert('Move error: ' + e); }
+        }));
+
+        // Delete (to trash)
+        const deleteItem = createMenuItem('Delete (to trash)', '🗑️', async () => {
+            if (!confirm(`Delete "${filePath.replace(/\\/g, '/').split('/').pop()}"?\nIt will be sent to the Recycle Bin.`)) return;
+            try {
+                const res = await fetch('/meta-prompt-extractor/delete-files', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filepaths: [filePath] })
+                });
+                const data = await res.json();
+                if (data.status === 'ok' || data.status === 'partial') {
+                    if (data.errors && data.errors.length > 0) alert('Delete errors:\n' + data.errors.join('\n'));
+                    if (navigateCallback) navigateCallback();
+                } else { alert('Delete failed: ' + (data.message || 'Unknown error')); }
+            } catch (e) { alert('Delete error: ' + e); }
+        });
+        deleteItem.style.color = '#e07070';
+        menu.appendChild(deleteItem);
+
+        // Mask Editor (images only)
+        const ext = filePath.replace(/\\/g, '/').split('/').pop().split('.').pop().toLowerCase();
+        if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) {
+            const sep2 = document.createElement('div');
+            sep2.style.cssText = 'height:1px;background:#2e3d4e;margin:4px 0;';
+            menu.appendChild(sep2);
+            menu.appendChild(createMenuItem('Open Mask Editor', '🎭', () => {
+                if (window.mpeOpenMaskEditor) {
+                    window.mpeOpenMaskEditor(filePath, () => {
+                        if (navigateCallback) navigateCallback();
+                    });
+                }
+            }));
+        }
+    }
     
     // Close menu when clicking outside
     const closeMenu = (e) => {
@@ -186,6 +911,294 @@ function showContextMenu(event, filePath, isDir, getBookmarks, addBookmark, remo
     document.addEventListener('mousedown', closeMenu);
     
     _activeContextMenu = menu;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lightweight Mask Editor — Meta Prompt Extractor
+// Controls: Draw (Left Click), Erase (Shift+Left), Pan (Middle), Zoom (Wheel)
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _mpe_mask_on_save_callback = null;
+let _mpe_mask_editor_initialized = false;
+
+function setupMpeGlobalMaskEditor() {
+    if (_mpe_mask_editor_initialized) return;
+    _mpe_mask_editor_initialized = true;
+
+    const css = `
+        .mpe-mask-editor-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); z-index: 10010; display: none; flex-direction: column; align-items: center; justify-content: center; }
+        .mpe-mask-editor-container { position: relative; background: #222; border: 1px solid #444; padding: 10px; border-radius: 8px; display: flex; flex-direction: column; height: 90vh; width: 90vw; }
+        .mpe-mask-editor-toolbar { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; color: #ddd; flex-shrink: 0; }
+        .mpe-mask-editor-canvas-wrapper { position: relative; overflow: hidden; background: #333; cursor: none; flex-grow: 1; }
+        .mpe-mask-editor-actions { margin-top: 10px; display: flex; justify-content: flex-end; gap: 10px; flex-shrink: 0; align-items: center; }
+        .mpe-mask-editor-btn-primary { background: #236694; color: white; border: none; padding: 5px 15px; border-radius: 4px; cursor: pointer; }
+        .mpe-mask-editor-btn-secondary { background: #444; color: white; border: none; padding: 5px 15px; border-radius: 4px; cursor: pointer; }
+        .mpe-brush-cursor { position: absolute; border: 1px solid rgba(255,255,255,0.9); box-shadow: 0 0 2px 1px rgba(0,0,0,0.8); border-radius: 50%; pointer-events: none; z-index: 10003; transform: translate(-50%, -50%); display: none; }
+        .mpe-mask-editor-toolbar select, .mpe-mask-editor-toolbar input[type=range] { background: #333; color: #eee; border: 1px solid #555; border-radius: 4px; padding: 2px 4px; }
+        .mpe-mask-editor-toolbar button { background: #444; color: #eee; border: 1px solid #555; border-radius: 4px; padding: 4px 10px; cursor: pointer; }
+        .mpe-mask-editor-toolbar button:hover { background: #555; }
+    `;
+    const styleEl = document.createElement('style');
+    styleEl.textContent = css;
+    document.head.appendChild(styleEl);
+
+    const html = `
+        <div id="mpe-mask-editor" class="mpe-mask-editor-overlay">
+            <div class="mpe-mask-editor-container">
+                <div class="mpe-mask-editor-toolbar">
+                    <label>Size:</label> <input type="range" id="mpe-mask-brush-size" min="1" max="100" value="20" title="Brush Size">
+                    <label style="margin-left:10px;">Softness:</label>
+                    <input type="range" id="mpe-mask-brush-blur" min="0" max="50" value="0" title="Edge Softness">
+                    <label style="margin-left:10px;">Color:</label>
+                    <select id="mpe-mask-display-mode" title="Mask Overlay Style">
+                        <option value="difference">Difference</option>
+                        <option value="white">White</option>
+                        <option value="black" selected>Black</option>
+                    </select>
+                    <button id="mpe-mask-clear" style="margin-left:10px;">Clear</button>
+                    <button id="mpe-mask-invert">Invert</button>
+                    <span style="font-size:12px;color:#888;margin-left:auto;">Left: Draw | Shift+Left: Erase | Middle: Pan | Wheel: Zoom</span>
+                </div>
+                <div id="mpe-mask-viewport" class="mpe-mask-editor-canvas-wrapper">
+                    <div id="mpe-brush-cursor" class="mpe-brush-cursor"></div>
+                    <div id="mpe-mask-content" style="position:absolute;top:0;left:0;transform-origin:0 0;">
+                        <img id="mpe-mask-bg-img" style="display:block;pointer-events:none;user-select:none;">
+                        <canvas id="mpe-mask-canvas" style="position:absolute;top:0;left:0;"></canvas>
+                    </div>
+                </div>
+                <div class="mpe-mask-editor-actions">
+                    <div id="mpe-mask-info" style="position:absolute;bottom:14px;left:10px;color:#eee;background:rgba(0,0,0,0.6);padding:4px 8px;border-radius:4px;font-size:14px;pointer-events:none;user-select:none;z-index:10002;font-family:monospace;">0 x 0 | 100%</div>
+                    <button id="mpe-mask-cancel" class="mpe-mask-editor-btn-secondary">Cancel</button>
+                    <button id="mpe-mask-save" class="mpe-mask-editor-btn-primary">Save Mask</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', html);
+
+    const overlay     = document.getElementById('mpe-mask-editor');
+    const viewport    = document.getElementById('mpe-mask-viewport');
+    const content     = document.getElementById('mpe-mask-content');
+    const bgImg       = document.getElementById('mpe-mask-bg-img');
+    const maskCanvas  = document.getElementById('mpe-mask-canvas');
+    const maskCtx     = maskCanvas.getContext('2d');
+    const brushCursor = document.getElementById('mpe-brush-cursor');
+
+    let editorState = { zoom: 1, panX: 0, panY: 0, isPanning: false, panStartX: 0, panStartY: 0 };
+    let isDrawingMask = false;
+    let currentImagePath = '';
+
+    const updateTransform = () => {
+        content.style.transform = `translate(${editorState.panX}px, ${editorState.panY}px) scale(${editorState.zoom})`;
+    };
+    const updateCursor = (e) => {
+        if (!e || editorState.isPanning) {
+            viewport.style.cursor = editorState.isPanning ? 'grabbing' : 'default';
+            brushCursor.style.display = 'none'; return;
+        }
+        const rect = viewport.getBoundingClientRect();
+        const x = e.clientX - rect.left, y = e.clientY - rect.top;
+        if (x < 0 || y < 0 || x > rect.width || y > rect.height) { brushCursor.style.display = 'none'; return; }
+        viewport.style.cursor = 'none';
+        brushCursor.style.display = 'block';
+        brushCursor.style.left = x + 'px'; brushCursor.style.top = y + 'px';
+        const size = document.getElementById('mpe-mask-brush-size').value * editorState.zoom;
+        brushCursor.style.width = size + 'px'; brushCursor.style.height = size + 'px';
+    };
+    const getMousePos = (e) => {
+        const rect = viewport.getBoundingClientRect();
+        return { x: (e.clientX - rect.left - editorState.panX) / editorState.zoom, y: (e.clientY - rect.top - editorState.panY) / editorState.zoom };
+    };
+    const drawMask = (e) => {
+        if (!isDrawingMask) return;
+        e.preventDefault();
+        const pos = getMousePos(e);
+        const size = document.getElementById('mpe-mask-brush-size').value;
+        const blur = document.getElementById('mpe-mask-brush-blur').value;
+        maskCtx.lineWidth = size; maskCtx.lineCap = 'round'; maskCtx.lineJoin = 'round';
+        maskCtx.shadowBlur = blur; maskCtx.shadowColor = 'white';
+        maskCtx.globalCompositeOperation = e.shiftKey ? 'destination-out' : 'source-over';
+        maskCtx.strokeStyle = 'white'; maskCtx.fillStyle = 'white';
+        maskCtx.lineTo(pos.x, pos.y); maskCtx.stroke();
+        maskCtx.beginPath(); maskCtx.arc(pos.x, pos.y, maskCtx.lineWidth / 2, 0, Math.PI * 2); maskCtx.fill();
+        maskCtx.beginPath(); maskCtx.moveTo(pos.x, pos.y);
+        maskCtx.shadowBlur = 0;
+    };
+
+    viewport.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const rect = viewport.getBoundingClientRect();
+        const mxw = (e.clientX - rect.left - editorState.panX) / editorState.zoom;
+        const myw = (e.clientY - rect.top  - editorState.panY) / editorState.zoom;
+        const newZoom = e.deltaY < 0 ? editorState.zoom * 1.1 : editorState.zoom / 1.1;
+        if (newZoom < 0.1 || newZoom > 20) return;
+        editorState.zoom = newZoom;
+        editorState.panX = (e.clientX - rect.left) - mxw * editorState.zoom;
+        editorState.panY = (e.clientY - rect.top)  - myw * editorState.zoom;
+        updateTransform(); updateCursor(e);
+        document.getElementById('mpe-mask-info').textContent = `${maskCanvas.width} x ${maskCanvas.height} | ${Math.round(editorState.zoom * 100)}%`;
+    });
+    viewport.addEventListener('mousedown', (e) => {
+        if (e.button === 1) { editorState.isPanning = true; editorState.panStartX = e.clientX; editorState.panStartY = e.clientY; }
+        else if (e.button === 0) { isDrawingMask = true; maskCtx.beginPath(); drawMask(e); }
+        updateCursor(e);
+    });
+    window.addEventListener('mousemove', (e) => {
+        if (editorState.isPanning) {
+            editorState.panX += e.clientX - editorState.panStartX; editorState.panY += e.clientY - editorState.panStartY;
+            editorState.panStartX = e.clientX; editorState.panStartY = e.clientY; updateTransform();
+        } else if (isDrawingMask) drawMask(e);
+        if (viewport.contains(e.target)) updateCursor(e); else brushCursor.style.display = 'none';
+    });
+    window.addEventListener('mouseup', (e) => { editorState.isPanning = false; isDrawingMask = false; maskCtx.beginPath(); updateCursor(e); });
+    viewport.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    document.getElementById('mpe-mask-cancel').onclick = () => { overlay.style.display = 'none'; };
+
+    document.getElementById('mpe-mask-save').onclick = async () => {
+        const dataUrl = maskCanvas.toDataURL('image/png');
+        const btn = document.getElementById('mpe-mask-save'); btn.textContent = 'Saving…'; btn.disabled = true;
+        try {
+            const saveRes = await fetch('/meta-prompt-extractor/save-mask', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image_path: currentImagePath, mask_data: dataUrl })
+            });
+            const saveData = await saveRes.json();
+            if (saveData.status !== 'ok') {
+                alert('Save mask failed: ' + (saveData.message || 'Unknown error'));
+                return;
+            }
+            // Notify all active MetaPromptExtractor nodes that their mask has changed.
+            // This re-assigns the widget value to itself, which forces ComfyUI to
+            // re-query IS_CHANGED on the next queue, picking up the new mask file.
+            _mpe_notifyMaskSaved(currentImagePath);
+            if (_mpe_mask_on_save_callback) _mpe_mask_on_save_callback();
+            overlay.style.display = 'none';
+        } catch (e) { alert('Failed to save mask: ' + e); }
+        finally { btn.textContent = 'Save Mask'; btn.disabled = false; }
+    };
+
+    document.getElementById('mpe-mask-clear').onclick = () => {
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+    };
+
+    document.getElementById('mpe-mask-invert').onclick = () => {
+        const iD = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+        const d = iD.data;
+        for (let i = 0; i < d.length; i += 4) {
+            d[i + 3] = 255 - d[i + 3]; d[i] = 255; d[i + 1] = 255; d[i + 2] = 255;
+        }
+        maskCtx.putImageData(iD, 0, 0);
+    };
+
+    const displaySelect = document.getElementById('mpe-mask-display-mode');
+    const updateMaskVisuals = () => {
+        const mode = displaySelect.value;
+        if (mode === 'difference') {
+            maskCanvas.style.mixBlendMode = 'difference'; maskCanvas.style.opacity = '1'; maskCanvas.style.filter = 'none';
+        } else if (mode === 'white') {
+            maskCanvas.style.mixBlendMode = 'normal'; maskCanvas.style.opacity = '0.75'; maskCanvas.style.filter = 'none';
+        } else if (mode === 'black') {
+            maskCanvas.style.mixBlendMode = 'normal'; maskCanvas.style.opacity = '0.75'; maskCanvas.style.filter = 'invert(1)';
+        }
+    };
+    displaySelect.addEventListener('change', updateMaskVisuals);
+    updateMaskVisuals();
+
+    window.mpeOpenMaskEditor = async (path, onSaveCallback) => {
+        currentImagePath = path;
+        _mpe_mask_on_save_callback = onSaveCallback;
+        const timestamp = Date.now();
+        const img = new Image();
+        img.onload = async () => {
+            overlay.style.display = 'flex';
+            maskCanvas.width = img.width; maskCanvas.height = img.height;
+            maskCanvas.style.width = img.width + 'px'; maskCanvas.style.height = img.height + 'px';
+            bgImg.src = img.src;
+            const vW = viewport.clientWidth, vH = viewport.clientHeight;
+            let scale = Math.min(vW / img.width, vH / img.height) * 0.9;
+            editorState.zoom = scale || 1;
+            editorState.panX = (vW - img.width  * editorState.zoom) / 2;
+            editorState.panY = (vH - img.height * editorState.zoom) / 2;
+            updateTransform();
+            document.getElementById('mpe-mask-info').textContent = `${img.width} x ${img.height} | ${Math.round(editorState.zoom * 100)}%`;
+
+            try {
+                const res  = await fetch('/meta-prompt-extractor/get-mask-path', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image_path: path })
+                });
+                const data = await res.json();
+                maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+
+                if (data.status === 'ok' && data.mask_path) {
+                    const mImg = new Image();
+                    mImg.onload = () => {
+                        maskCtx.drawImage(mImg, 0, 0);
+                        const iD = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+                        for (let i = 0; i < iD.data.length; i += 4) {
+                            const alpha = iD.data[i + 3] < 255 ? iD.data[i + 3] : iD.data[i];
+                            iD.data[i] = 255; iD.data[i + 1] = 255; iD.data[i + 2] = 255; iD.data[i + 3] = alpha;
+                        }
+                        maskCtx.putImageData(iD, 0, 0);
+                    };
+                    mImg.src = `/meta-prompt-extractor/serve-file?path=${encodeURIComponent(data.mask_path)}&t=${timestamp}`;
+                } else {
+                    // Auto-mask from alpha channel
+                    const tempCanvas = document.createElement('canvas');
+                    tempCanvas.width = img.width; tempCanvas.height = img.height;
+                    const tempCtx = tempCanvas.getContext('2d');
+                    tempCtx.drawImage(img, 0, 0);
+                    const origData = tempCtx.getImageData(0, 0, img.width, img.height).data;
+                    const maskImageData = maskCtx.createImageData(maskCanvas.width, maskCanvas.height);
+                    const maskPixels = maskImageData.data;
+                    let hasTransparency = false;
+                    for (let i = 0; i < origData.length; i += 4) {
+                        const maskAlpha = 255 - origData[i + 3];
+                        if (maskAlpha > 0) {
+                            maskPixels[i] = 255; maskPixels[i + 1] = 255; maskPixels[i + 2] = 255; maskPixels[i + 3] = maskAlpha;
+                            hasTransparency = true;
+                        }
+                    }
+                    if (hasTransparency) maskCtx.putImageData(maskImageData, 0, 0);
+                }
+            } catch (e) { console.error('[MpeEditor]', e); }
+        };
+        img.src = `/meta-prompt-extractor/serve-file?path=${encodeURIComponent(path)}&t=${timestamp}`;
+    };
+}
+setupMpeGlobalMaskEditor();
+
+// ─── Node registry + mask-save notifier ──────────────────────────────────────
+// Every MetaPromptExtractor node registers itself here on creation.
+// When a mask is saved/cleared we iterate the registry and re-dirty the widget
+// of any node whose currently-selected image path matches, so that ComfyUI
+// re-queries IS_CHANGED on the next prompt queue.
+window._mpe_nodeRegistry = window._mpe_nodeRegistry || new Set();
+
+function _mpe_notifyMaskSaved(savedImagePath) {
+    for (const nodeRef of window._mpe_nodeRegistry) {
+        try {
+            const node = nodeRef.deref ? nodeRef.deref() : nodeRef;
+            if (!node) { window._mpe_nodeRegistry.delete(nodeRef); continue; }
+            const imgWidget = node.widgets?.find(w => w.name === 'image');
+            if (!imgWidget) continue;
+            const nodePath = (imgWidget.value || '').replace(/\\/g, '/');
+            const maskPath = (savedImagePath || '').replace(/\\/g, '/');
+            if (nodePath === maskPath) {
+                // Re-assign value to itself — marks widget dirty so IS_CHANGED
+                // is re-evaluated on next queue without changing the user's selection.
+                const cur = imgWidget.value;
+                imgWidget.value = '';
+                imgWidget.value = cur;
+                node.setDirtyCanvas(true, true);
+                console.log('[MetaPromptExtractor] Notified node of mask change:', nodePath);
+            }
+        } catch (e) {
+            console.warn('[MetaPromptExtractor] Error notifying node:', e);
+        }
+    }
 }
 
 async function createFileBrowserModal(currentFile, onSelect) {
@@ -701,15 +1714,48 @@ async function createFileBrowserModal(currentFile, onSelect) {
     const cancelBtn = document.createElement('button');
     cancelBtn.textContent = 'Cancel';
     cancelBtn.style.cssText = 'background:#2a3040;border:1px solid #3a4a5a;border-radius:6px;color:#9ab8d0;padding:7px 16px;font-size:13px;cursor:pointer;';
-    footer.appendChild(selectedLabel); footer.appendChild(cancelBtn); footer.appendChild(selectBtn);
+    const maskEditorBtn = document.createElement('button');
+    maskEditorBtn.textContent = '🎭 Mask Editor';
+    maskEditorBtn.title = 'Open mask editor for the selected image';
+    maskEditorBtn.style.cssText = 'background:#2a3040;border:1px solid #3a4a5a;border-radius:6px;color:#9ab8d0;padding:7px 12px;font-size:13px;cursor:pointer;';
+    maskEditorBtn.disabled = true;
+    maskEditorBtn.style.opacity = '0.5';
+    footer.appendChild(selectedLabel);
+    footer.appendChild(maskEditorBtn);
+    footer.appendChild(cancelBtn);
+    footer.appendChild(selectBtn);
     modal.appendChild(footer);
 
     let currentPath = null;
-    let selectedPath = (currentFile && isAbsolutePath(currentFile)) ? currentFile : null;
+    // Prefer the persisted last-selected file; fall back to currentFile passed by caller
+    let selectedPath = _uiState.lastSelectedFile || ((currentFile && isAbsolutePath(currentFile)) ? currentFile : null);
     let currentBrowseData = null;
     // Track whether the last navigation came from a bookmark click (hides subdirs in middle panel)
     let _navigatedFromBookmark = false;
-    if (selectedPath) { selectBtn.disabled = false; selectBtn.style.opacity = '1'; }
+
+    const _updateFooterButtons = () => {
+        if (selectedPath) {
+            selectBtn.disabled = false; selectBtn.style.opacity = '1';
+            const ext = selectedPath.replace(/\\/g, '/').split('/').pop().split('.').pop().toLowerCase();
+            const isImg = ['png','jpg','jpeg','webp'].includes(ext);
+            maskEditorBtn.disabled = !isImg;
+            maskEditorBtn.style.opacity = isImg ? '1' : '0.5';
+        } else {
+            selectBtn.disabled = true; selectBtn.style.opacity = '0.5';
+            maskEditorBtn.disabled = true; maskEditorBtn.style.opacity = '0.5';
+        }
+    };
+
+    maskEditorBtn.onclick = () => {
+        if (!selectedPath || maskEditorBtn.disabled) return;
+        if (window.mpeOpenMaskEditor) {
+            window.mpeOpenMaskEditor(selectedPath, () => {
+                if (currentPath) navigate(currentPath);
+            });
+        }
+    };
+
+    if (selectedPath) { _updateFooterButtons(); }
 
     // ─── Metadata Extraction Functions ───
     const extractMetadataFromBlob = async (blob, filename) => {
@@ -1110,9 +2156,39 @@ async function createFileBrowserModal(currentFile, onSelect) {
         return sorted;
     };
 
+    // ─── Multi-selection state for image grid ────────────────────────────────
+    // selectedPaths is a Set of file paths currently selected in the grid.
+    // selectedPath (singular, already declared above) is the "primary" selection
+    // shown in the footer; we sync it to the last-clicked item.
+    const selectedPaths = new Set();
+    let _lastClickedIdx = -1; // index of last single-clicked image for shift-range
+
+    // Helper: update visual state of all imgWrapper elements in the current grid
+    const _refreshSelectionVisuals = (imageGridContainer) => {
+        if (!imageGridContainer) return;
+        for (const wrapper of imageGridContainer.querySelectorAll('[data-img-path]')) {
+            const p = wrapper.dataset.imgPath;
+            const isSel = selectedPaths.has(p);
+            wrapper.style.border = `2px solid ${isSel ? '#4a90d9' : '#3a4a5a'}`;
+            wrapper.style.boxShadow = isSel ? '0 0 0 1px #4a90d9 inset' : 'none';
+            const cb = wrapper.querySelector('.mpe-sel-cb');
+            if (cb) cb.checked = isSel;
+        }
+        // Update footer label
+        if (selectedPaths.size > 1) {
+            selectedLabel.textContent = `${selectedPaths.size} images selected`;
+        } else if (selectedPaths.size === 1) {
+            selectedLabel.textContent = `Selected: ${[...selectedPaths][0]}`;
+        }
+    };
+
     const renderDir = (data) => {
         currentBrowseData = data;
         listContainer.innerHTML = '';
+        // Clear multi-selection when directory changes
+        selectedPaths.clear();
+        _lastClickedIdx = -1;
+
         if (!data.entries || data.entries.length === 0) {
             listContainer.innerHTML = '<div style="color:#7a9ab8;font-size:13px;padding:20px;text-align:center;">Empty folder</div>';
             return;
@@ -1180,7 +2256,7 @@ async function createFileBrowserModal(currentFile, onSelect) {
             nameSpan.style.cssText = `flex:1;font-size:13px;color:#9bcce8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
             row.appendChild(icon); row.appendChild(nameSpan);
             row.onclick = () => navigate(entry.path);
-            row.oncontextmenu = (e) => showContextMenu(e, entry.path, true, getBookmarks, addBookmark, removeBookmark, renderBookmarks);
+            row.oncontextmenu = (e) => showContextMenu(e, entry.path, true, getBookmarks, addBookmark, removeBookmark, renderBookmarks, () => navigate(currentPath));
             listContainer.appendChild(row);
         }
         
@@ -1257,15 +2333,16 @@ async function createFileBrowserModal(currentFile, onSelect) {
             row.onclick = () => {
                 selectedPath = entry.path;
                 selectedLabel.textContent = `Selected: ${entry.path}`;
-                selectBtn.disabled = false; selectBtn.style.opacity = '1';
+                saveUIState({ lastSelectedFile: entry.path });
+                _updateFooterButtons();
                 renderDir(currentBrowseData);
             };
             row.ondblclick = () => { selectedPath = entry.path; cleanup(); onSelect(selectedPath); };
-            row.oncontextmenu = (e) => showContextMenu(e, entry.path, false, getBookmarks, addBookmark, removeBookmark, renderBookmarks);
+            row.oncontextmenu = (e) => showContextMenu(e, entry.path, false, getBookmarks, addBookmark, removeBookmark, renderBookmarks, () => navigate(currentPath));
             listContainer.appendChild(row);
         }
         
-        // Render images as thumbnails with lazy loading via IntersectionObserver.
+        // ─── Render images as thumbnails with lazy loading + multi-selection ───
         // DOM wrappers for ALL images are created immediately (so the grid has
         // the correct height/scrollbar), but img.src is only set once a wrapper
         // scrolls into the viewport — the browser never issues a network request
@@ -1316,10 +2393,16 @@ async function createFileBrowserModal(currentFile, onSelect) {
                 threshold: 0
             });
 
-            for (const entry of sortedImageFiles) {
-                const isSelected = entry.path === selectedPath;
+            // ── Drag ghost element shared across all imgWrappers ──
+            let _dragGhost = null;
+
+            for (let imgIdx = 0; imgIdx < sortedImageFiles.length; imgIdx++) {
+                const entry = sortedImageFiles[imgIdx];
+                const isGridSelected = selectedPaths.has(entry.path);
                 const imgWrapper = document.createElement('div');
-                imgWrapper.style.cssText = `position:relative;aspect-ratio:1;border:2px solid ${isSelected?'#2a6ea6':'#3a4a5a'};border-radius:6px;overflow:hidden;cursor:pointer;background:#111820;flex-direction:column;display:flex;align-items:center;justify-content:center;`;
+                imgWrapper.style.cssText = `position:relative;aspect-ratio:1;border:2px solid ${isGridSelected?'#4a90d9':'#3a4a5a'};border-radius:6px;overflow:hidden;cursor:pointer;background:#111820;flex-direction:column;display:flex;align-items:center;justify-content:center;box-shadow:${isGridSelected?'0 0 0 1px #4a90d9 inset':'none'};`;
+                imgWrapper.dataset.imgPath = entry.path;
+                imgWrapper.dataset.imgIdx = imgIdx;
 
                 // Build preview URL
                 let previewUrl = '';
@@ -1333,9 +2416,34 @@ async function createFileBrowserModal(currentFile, onSelect) {
                     if (subfolder) previewUrl += `&subfolder=${encodeURIComponent(subfolder)}`;
                 }
 
+                // ── Selection checkbox (top-left corner) ──
+                const cbWrap = document.createElement('label');
+                cbWrap.style.cssText = 'position:absolute;top:5px;left:5px;z-index:5;display:flex;align-items:center;justify-content:center;width:18px;height:18px;cursor:pointer;';
+                cbWrap.title = 'Select image';
+                cbWrap.onclick = (e) => e.stopPropagation(); // prevent bubbling to imgWrapper
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.className = 'mpe-sel-cb';
+                cb.checked = isGridSelected;
+                cb.style.cssText = 'width:14px;height:14px;cursor:pointer;accent-color:#4a90d9;';
+                cb.onchange = (e) => {
+                    e.stopPropagation();
+                    if (cb.checked) {
+                        selectedPaths.add(entry.path);
+                    } else {
+                        selectedPaths.delete(entry.path);
+                    }
+                    _lastClickedIdx = imgIdx;
+                    selectedPath = entry.path;
+                    _updateFooterButtons();
+                    _refreshSelectionVisuals(imageGridContainer);
+                };
+                cbWrap.appendChild(cb);
+                imgWrapper.appendChild(cbWrap);
+
                 // Create img element but do NOT set src yet
                 const img = document.createElement('img');
-                img.style.cssText = 'max-width:100%;max-height:100%;object-fit:contain;';
+                img.style.cssText = 'max-width:100%;max-height:100%;object-fit:contain;pointer-events:none;';
                 imgWrapper.appendChild(img);
 
                 // Filename label
@@ -1345,9 +2453,9 @@ async function createFileBrowserModal(currentFile, onSelect) {
                 nameLabel.title = entry.name;
                 imgWrapper.appendChild(nameLabel);
 
-                // Hover info overlay
+                // Hover info overlay — reduced dark effect by 70% (0.8 → 0.24)
                 const infoOverlay = document.createElement('div');
-                infoOverlay.style.cssText = 'position:absolute;inset:0;background:rgba(0,0,0,0.8);color:#a8dff0;font-size:9px;padding:6px;opacity:0;display:flex;align-items:flex-end;justify-content:center;text-align:center;line-height:1.3;transition:opacity 0.2s;';
+                infoOverlay.style.cssText = 'position:absolute;inset:0;background:rgba(0,0,0,0.24);color:#a8dff0;font-size:9px;padding:6px;opacity:0;display:flex;align-items:flex-end;justify-content:center;text-align:center;line-height:1.3;transition:opacity 0.2s;pointer-events:none;';
                 let infoText = [];
                 if (entry.size !== undefined) {
                     infoText.push(entry.size < 1024 ? entry.size + 'B' :
@@ -1369,21 +2477,107 @@ async function createFileBrowserModal(currentFile, onSelect) {
 
                 imgWrapper.onmouseenter = () => { infoOverlay.style.opacity = '1'; };
                 imgWrapper.onmouseleave = () => { infoOverlay.style.opacity = '0'; };
-                imgWrapper.onclick = () => {
-                    selectedPath = entry.path;
-                    selectedLabel.textContent = `Selected: ${entry.path}`;
-                    selectBtn.disabled = false; selectBtn.style.opacity = '1';
-                    displayMetadata(entry.path);
-                    renderDir(currentBrowseData);
+
+                // ── Click handling: simple, Ctrl, Shift ──
+                imgWrapper.onclick = (e) => {
+                    // Ignore if clicking on the checkbox itself
+                    if (e.target === cb || e.target === cbWrap) return;
+
+                    if (e.ctrlKey || e.metaKey) {
+                        // Ctrl+click: toggle this image in/out of selection
+                        if (selectedPaths.has(entry.path)) {
+                            selectedPaths.delete(entry.path);
+                        } else {
+                            selectedPaths.add(entry.path);
+                        }
+                        _lastClickedIdx = imgIdx;
+                        selectedPath = entry.path;
+                    } else if (e.shiftKey && _lastClickedIdx >= 0) {
+                        // Shift+click: select range [_lastClickedIdx, imgIdx]
+                        const lo = Math.min(_lastClickedIdx, imgIdx);
+                        const hi = Math.max(_lastClickedIdx, imgIdx);
+                        selectedPaths.clear();
+                        for (let i = lo; i <= hi; i++) {
+                            selectedPaths.add(sortedImageFiles[i].path);
+                        }
+                        selectedPath = entry.path;
+                    } else {
+                        // Plain click: select only this image
+                        selectedPaths.clear();
+                        selectedPaths.add(entry.path);
+                        _lastClickedIdx = imgIdx;
+                        selectedPath = entry.path;
+                        saveUIState({ lastSelectedFile: entry.path });
+                        displayMetadata(entry.path);
+                    }
+                    _updateFooterButtons();
+                    _refreshSelectionVisuals(imageGridContainer);
                 };
-                imgWrapper.ondblclick = () => { selectedPath = entry.path; cleanup(); onSelect(selectedPath); };
-                imgWrapper.oncontextmenu = (e) => showContextMenu(e, entry.path, false, getBookmarks, addBookmark, removeBookmark, renderBookmarks);
+
+                imgWrapper.ondblclick = () => { selectedPath = entry.path; saveUIState({ lastSelectedFile: entry.path }); cleanup(); onSelect(selectedPath); };
+                imgWrapper.oncontextmenu = (e) => {
+                    // If right-clicking an item that isn't yet selected, select it first
+                    if (!selectedPaths.has(entry.path)) {
+                        selectedPaths.clear();
+                        selectedPaths.add(entry.path);
+                        selectedPath = entry.path;
+                        _lastClickedIdx = imgIdx;
+                        _refreshSelectionVisuals(imageGridContainer);
+                    }
+                    showContextMenu(e, entry.path, false, getBookmarks, addBookmark, removeBookmark, renderBookmarks, () => navigate(currentPath));
+                };
+
+                // ── Drag-to-favorite: drag selected image(s) onto a bookmark folder ──
+                imgWrapper.draggable = true;
+                imgWrapper.addEventListener('dragstart', (e) => {
+                    // If the dragged image isn't in the selection, make it the sole selection
+                    if (!selectedPaths.has(entry.path)) {
+                        selectedPaths.clear();
+                        selectedPaths.add(entry.path);
+                        selectedPath = entry.path;
+                        _lastClickedIdx = imgIdx;
+                        _refreshSelectionVisuals(imageGridContainer);
+                    }
+                    const paths = [...selectedPaths];
+                    e.dataTransfer.setData('application/x-mpe-paths', JSON.stringify(paths));
+                    e.dataTransfer.effectAllowed = 'move';
+
+                    // Build a custom ghost showing count
+                    _dragGhost = document.createElement('div');
+                    _dragGhost.style.cssText = 'position:fixed;top:-200px;left:0;background:#2a6ea6;color:#fff;padding:6px 12px;border-radius:6px;font-size:13px;font-family:sans-serif;font-weight:600;pointer-events:none;z-index:99999;';
+                    _dragGhost.textContent = paths.length > 1 ? `🖼 Moving ${paths.length} images` : `🖼 Moving ${entry.name}`;
+                    document.body.appendChild(_dragGhost);
+                    e.dataTransfer.setDragImage(_dragGhost, 0, 0);
+                });
+
+                imgWrapper.addEventListener('dragend', () => {
+                    if (_dragGhost) { _dragGhost.remove(); _dragGhost = null; }
+                });
 
                 imageGridContainer.appendChild(imgWrapper);
                 lazyObserver.observe(imgWrapper);
             }
 
             listContainer.appendChild(imageGridContainer);
+
+            // ── Restore selection + scroll to last-selected image ──────────────
+            // If selectedPath is one of the images in this directory, mark it as
+            // selected and scroll it into view.  We use requestAnimationFrame so
+            // the browser has laid out the grid before we call scrollIntoView.
+            if (selectedPath) {
+                const matchWrapper = imageGridContainer.querySelector(
+                    `[data-img-path="${CSS.escape(selectedPath)}"]`
+                );
+                if (matchWrapper) {
+                    // Pre-populate selection set so checkbox + border are correct
+                    selectedPaths.add(selectedPath);
+                    _refreshSelectionVisuals(imageGridContainer);
+                    // Scroll after the next paint so the element has real dimensions
+                    requestAnimationFrame(() => {
+                        matchWrapper.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                    });
+                }
+            }
 
             // Clean up the observer when this grid is replaced by the next renderDir call.
             // We watch for the grid's removal from the DOM using a MutationObserver.
@@ -1616,6 +2810,44 @@ async function createFileBrowserModal(currentFile, onSelect) {
             navigate(folderPath, true);
         };
 
+        // ── Drop target: accept dragged images from the grid ──
+        row.addEventListener('dragover', (e) => {
+            if (e.dataTransfer.types.includes('application/x-mpe-paths')) {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                row.style.background = 'rgba(74,144,217,0.35)';
+                row.style.borderLeft = '3px solid #4a90d9';
+            }
+        });
+        row.addEventListener('dragleave', (e) => {
+            if (!row.contains(e.relatedTarget)) {
+                row.style.background = isCurrentPath ? 'rgba(42,110,166,0.35)' : 'transparent';
+                row.style.borderLeft = `3px solid ${isCurrentPath ? '#2a6ea6' : 'transparent'}`;
+            }
+        });
+        row.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            row.style.background = isCurrentPath ? 'rgba(42,110,166,0.35)' : 'transparent';
+            row.style.borderLeft = `3px solid ${isCurrentPath ? '#2a6ea6' : 'transparent'}`;
+            let paths = [];
+            try { paths = JSON.parse(e.dataTransfer.getData('application/x-mpe-paths')); } catch {}
+            if (!paths.length) return;
+            // Move files to this bookmark folder
+            try {
+                const res = await fetch('/meta-prompt-extractor/move-files', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ source_paths: paths, destination_dir: folderPath })
+                });
+                const data = await res.json();
+                if (data.status === 'ok' || data.status === 'partial') {
+                    if (data.errors && data.errors.length > 0) alert('Move errors:\n' + data.errors.join('\n'));
+                    // Refresh the middle panel since files have moved away
+                    if (currentPath) navigate(currentPath, _navigatedFromBookmark);
+                } else { alert('Move failed: ' + (data.message || 'Unknown error')); }
+            } catch (err) { alert('Move error: ' + err); }
+        });
+
         container.appendChild(wrapper);
     };
 
@@ -1767,7 +2999,7 @@ async function createFileBrowserModal(currentFile, onSelect) {
     cancelBtn.onclick = () => cleanup();
     closeBtn.onclick  = () => cleanup();
     overlay.onclick   = (e) => { if (e.target === overlay) cleanup(); };
-    selectBtn.onclick = () => { if (selectedPath) { cleanup(); onSelect(selectedPath); } };
+    selectBtn.onclick = () => { if (selectedPath) { saveUIState({ lastSelectedFile: selectedPath }); cleanup(); onSelect(selectedPath); } };
     pathInput.onkeydown = (e) => { if (e.key === 'Enter' && pathInput.value.trim()) navigate(pathInput.value.trim()); };
     document.addEventListener('keydown', handleKey);
     function handleKey(e) { if (e.key === 'Escape') cleanup(); }
@@ -1780,26 +3012,28 @@ async function createFileBrowserModal(currentFile, onSelect) {
     // Initialize metadata panel
     clearMetadata();
 
-    // Start navigation
+    // Start navigation — derive folder from last selected file, then lastBrowsedPath, then caller's currentFile
     let startPath = null;
-    
-    // Restore last browsed directory from saved UI state
-    if (_uiState.lastBrowsedPath) {
+
+    if (selectedPath && isAbsolutePath(selectedPath)) {
+        // Navigate to the folder containing the last selected file
+        const parts = selectedPath.replace(/\\/g, '/').split('/');
+        parts.pop();
+        startPath = parts.join('/') || '/';
+    } else if (_uiState.lastBrowsedPath) {
         startPath = _uiState.lastBrowsedPath;
-    }
-    
-    if (!startPath && currentFile && isAbsolutePath(currentFile)) {
+    } else if (currentFile && isAbsolutePath(currentFile)) {
         const parts = currentFile.replace(/\\/g, '/').split('/');
         parts.pop();
         startPath = parts.join('/') || '/';
     }
-    
+
     if (startPath) {
         renderBreadcrumbs(startPath);
         navigate(startPath);
-    } else { 
+    } else {
         renderBreadcrumbs(null);
-        homeBtn.click(); 
+        homeBtn.click();
     }
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2373,6 +3607,14 @@ app.registerExtension({
             node._loadedFramePosition = null;
             node._metadataCached      = false;
 
+            // Register this node so _mpe_notifyMaskSaved can find it.
+            // Use WeakRef if available so GC'd nodes don't accumulate.
+            if (typeof WeakRef !== 'undefined') {
+                window._mpe_nodeRegistry.add(new WeakRef(node));
+            } else {
+                window._mpe_nodeRegistry.add(node);
+            }
+
             // ── Debug: Log all widgets ──
             console.log("[MetaPromptExtractor] onNodeCreated - widgets:", node.widgets?.map(w => ({ name: w.name, type: w.type, value: w.value })) || "NO WIDGETS");
             console.log("[MetaPromptExtractor] Node inputs:", node.inputs?.map(i => ({ name: i.name, type: i.type })) || "NO INPUTS");
@@ -2509,11 +3751,14 @@ app.registerExtension({
                     }
                 }
 
-                // Fix output shape (migration from old versions with lora/recipe outputs)
+                // Fix output shape — must match Python RETURN_TYPES/RETURN_NAMES exactly:
+                // ("STRING","STRING","IMAGE","MASK","STRING") / ("positive_prompt","negative_prompt","image","mask","path")
                 const VALID_OUTPUTS = [
                     { name: "positive_prompt", type: "STRING" },
                     { name: "negative_prompt", type: "STRING" },
                     { name: "image",           type: "IMAGE"  },
+                    { name: "mask",            type: "MASK"   },
+                    { name: "path",            type: "STRING" },
                 ];
                 if (this.outputs) {
                     const ok = this.outputs.length === VALID_OUTPUTS.length &&

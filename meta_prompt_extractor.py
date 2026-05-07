@@ -943,6 +943,48 @@ def _placeholder_tensor():
         return torch.from_numpy(arr).unsqueeze(0)
     return torch.zeros((1, 128, 128, 3), dtype=torch.float32)
 
+def _placeholder_mask():
+    """Return an empty (all-black) 1x128x128 mask tensor."""
+    return torch.zeros((1, 128, 128), dtype=torch.float32)
+
+def _load_mask_for_image(image_path):
+    """
+    Load a saved mask for the given image path.
+    Looks next to the image first, then in the ComfyUI input directory.
+    Returns a (1, H, W) float32 tensor, or a placeholder if no mask exists.
+    """
+    if not IMAGE_SUPPORT or not image_path:
+        return _placeholder_mask()
+    try:
+        filename = os.path.basename(image_path)
+        name, _ = os.path.splitext(filename)
+        mask_filename = f"{name}_mask.png"
+
+        # Priority 1: same directory as the image
+        candidate = os.path.join(os.path.dirname(image_path), mask_filename)
+        # Priority 2: ComfyUI input directory
+        input_candidate = os.path.join(folder_paths.get_input_directory(), mask_filename)
+
+        mask_file = None
+        if os.path.exists(candidate):
+            mask_file = candidate
+        elif os.path.exists(input_candidate):
+            mask_file = input_candidate
+
+        if mask_file is None:
+            return _placeholder_mask()
+
+        with Image.open(mask_file) as mask_img:
+            if "A" in mask_img.getbands():
+                mask_data = mask_img.split()[-1]
+            else:
+                mask_data = mask_img.convert("L")
+            mask_np = np.array(mask_data).astype(np.float32) / 255.0
+            return torch.from_numpy(mask_np).unsqueeze(0)
+    except Exception as e:
+        print(f"{TAG} Warning: could not load mask for {image_path}: {e}")
+        return _placeholder_mask()
+
 # ── API Endpoints ─────────────────────────────────────────────────────────────
 
 @server.PromptServer.instance.routes.post("/meta-prompt-extractor/cache-file-metadata")
@@ -1298,8 +1340,8 @@ class MetaPromptExtractor:
         "Extract positive and negative prompts from ComfyUI images "
         "or workflow JSON files stored anywhere on disk."
     )
-    RETURN_TYPES  = ("STRING", "STRING", "IMAGE")
-    RETURN_NAMES  = ("positive_prompt", "negative_prompt", "image")
+    RETURN_TYPES  = ("STRING", "STRING", "IMAGE", "MASK", "STRING")
+    RETURN_NAMES  = ("positive_prompt", "negative_prompt", "image", "mask", "path")
     FUNCTION      = "extract"
     OUTPUT_NODE   = False
 
@@ -1314,8 +1356,10 @@ class MetaPromptExtractor:
         image_tensor    = None
 
         file_path = (image or "").strip()
+        # Smart Path Fallback: return input dir path when no file is selected
+        fallback_path = folder_paths.get_input_directory()
         if file_path in ("", "(none)"):
-            return positive_prompt, negative_prompt, _placeholder_tensor()
+            return positive_prompt, negative_prompt, _placeholder_tensor(), _placeholder_mask(), fallback_path
 
         resolved = None
         if os.path.isabs(file_path):
@@ -1330,7 +1374,7 @@ class MetaPromptExtractor:
                     break
 
         if not resolved:
-            return positive_prompt, negative_prompt, _placeholder_tensor()
+            return positive_prompt, negative_prompt, _placeholder_tensor(), _placeholder_mask(), fallback_path
 
         ext = os.path.splitext(resolved)[1].lower()
 
@@ -1354,18 +1398,267 @@ class MetaPromptExtractor:
         if image_tensor is None:
             image_tensor = _placeholder_tensor()
 
-        return positive_prompt, negative_prompt, image_tensor
+        # Intelligent RGB Conversion: strip alpha channel if fully opaque
+        if image_tensor is not None and image_tensor.shape[-1] == 4:
+            alpha = image_tensor[:, :, :, 3]
+            if float(alpha.min()) > 0.9999:
+                image_tensor = image_tensor[:, :, :, :3]
+
+        # Load mask file if it exists alongside the image
+        mask_tensor = _load_mask_for_image(resolved)
+
+        return positive_prompt, negative_prompt, image_tensor, mask_tensor, resolved
 
     @classmethod
     def IS_CHANGED(cls, image="", **kwargs):
-        mtime = "no_file"
+        # Build a hash of: image mtime + mask mtime (if any).
+        # This ensures ComfyUI re-executes whenever the mask is saved/cleared,
+        # not only when the image itself changes.
+        import hashlib
+        h = hashlib.sha256()
         if image and image.strip() not in ("", "(none)"):
             p = image.strip()
             if not os.path.isabs(p):
                 p = os.path.join(folder_paths.get_input_directory(), p)
             if os.path.isfile(p):
-                mtime = os.path.getmtime(p)
-        return mtime
+                h.update(str(os.path.getmtime(p)).encode())
+                # Also hash the mask file if it exists
+                filename = os.path.basename(p)
+                name, _ = os.path.splitext(filename)
+                mask_filename = f"{name}_mask.png"
+                for mask_candidate in (
+                    os.path.join(os.path.dirname(p), mask_filename),
+                    os.path.join(folder_paths.get_input_directory(), mask_filename),
+                ):
+                    if os.path.isfile(mask_candidate):
+                        h.update(str(os.path.getmtime(mask_candidate)).encode())
+                        h.update(mask_candidate.encode())
+                        break
+            else:
+                h.update(b"no_file")
+        else:
+            h.update(b"no_file")
+        return h.hexdigest()
+
+# ── File Management Endpoints ─────────────────────────────────────────────────
+# These power the Move, Delete (to trash), Rename, and Mask Editor features
+# inside the Browse Files floating window.
+
+try:
+    from send2trash import send2trash as _send2trash
+    _TRASH_AVAILABLE = True
+except ImportError:
+    _TRASH_AVAILABLE = False
+    print(f"{TAG} Warning: send2trash not installed; Delete will permanently remove files.")
+
+import shutil as _shutil
+import base64 as _base64
+
+@server.PromptServer.instance.routes.post("/meta-prompt-extractor/delete-files")
+async def _mpe_delete_files(request):
+    try:
+        data = await request.json()
+        filepaths = data.get("filepaths", [])
+        if not isinstance(filepaths, list):
+            return server.web.json_response({"status": "error", "message": "Invalid data."}, status=400)
+
+        errors = []
+        for filepath in filepaths:
+            if not filepath or not os.path.isabs(filepath) or ".." in filepath:
+                continue
+            if not os.path.isfile(filepath):
+                continue
+            try:
+                if _TRASH_AVAILABLE:
+                    _send2trash(os.path.normpath(filepath))
+                else:
+                    os.remove(filepath)
+            except Exception as e:
+                errors.append(f"{os.path.basename(filepath)}: {e}")
+
+        if errors:
+            return server.web.json_response({"status": "partial", "errors": errors})
+        return server.web.json_response({"status": "ok"})
+    except Exception as e:
+        return server.web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+def _resolve_unique_dest(dest_dir, filename):
+    """Return a destination path that does not already exist, adding (N) suffix if needed."""
+    final_dest = os.path.join(dest_dir, filename)
+    if not os.path.exists(final_dest):
+        return final_dest
+    base, ext = os.path.splitext(filename)
+    counter = 1
+    while os.path.exists(final_dest):
+        final_dest = os.path.join(dest_dir, f"{base} ({counter}){ext}")
+        counter += 1
+    return final_dest
+
+
+@server.PromptServer.instance.routes.post("/meta-prompt-extractor/move-files")
+async def _mpe_move_files(request):
+    """Move files from their current location to a new directory (removes originals)."""
+    try:
+        data = await request.json()
+        source_paths = data.get("source_paths", [])
+        destination_dir = data.get("destination_dir", "")
+
+        if not isinstance(source_paths, list) or not destination_dir:
+            return server.web.json_response({"status": "error", "message": "Invalid data."}, status=400)
+
+        dest = os.path.normpath(destination_dir)
+        if not os.path.isabs(dest) or not os.path.isdir(dest):
+            return server.web.json_response({"status": "error", "message": "Invalid destination directory."}, status=400)
+
+        errors = []
+        for src in source_paths:
+            try:
+                norm_src = os.path.normpath(src)
+                if not os.path.isabs(norm_src) or not os.path.isfile(norm_src):
+                    continue
+                if os.path.dirname(norm_src) == dest:
+                    continue
+                final_dest = _resolve_unique_dest(dest, os.path.basename(norm_src))
+                _shutil.move(norm_src, final_dest)   # moves (removes source)
+            except Exception as e:
+                errors.append(f"{os.path.basename(src)}: {e}")
+
+        if errors:
+            return server.web.json_response({"status": "partial", "errors": errors})
+        return server.web.json_response({"status": "ok"})
+    except Exception as e:
+        return server.web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+@server.PromptServer.instance.routes.post("/meta-prompt-extractor/copy-files")
+async def _mpe_copy_files(request):
+    """Copy files to a new directory, leaving originals in place."""
+    try:
+        data = await request.json()
+        source_paths = data.get("source_paths", [])
+        destination_dir = data.get("destination_dir", "")
+
+        if not isinstance(source_paths, list) or not destination_dir:
+            return server.web.json_response({"status": "error", "message": "Invalid data."}, status=400)
+
+        dest = os.path.normpath(destination_dir)
+        if not os.path.isabs(dest) or not os.path.isdir(dest):
+            return server.web.json_response({"status": "error", "message": "Invalid destination directory."}, status=400)
+
+        errors = []
+        for src in source_paths:
+            try:
+                norm_src = os.path.normpath(src)
+                if not os.path.isabs(norm_src) or not os.path.isfile(norm_src):
+                    continue
+                final_dest = _resolve_unique_dest(dest, os.path.basename(norm_src))
+                _shutil.copy2(norm_src, final_dest)  # copies (leaves source intact)
+            except Exception as e:
+                errors.append(f"{os.path.basename(src)}: {e}")
+
+        if errors:
+            return server.web.json_response({"status": "partial", "errors": errors})
+        return server.web.json_response({"status": "ok"})
+    except Exception as e:
+        return server.web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+@server.PromptServer.instance.routes.post("/meta-prompt-extractor/rename-file")
+async def _mpe_rename_file(request):
+    try:
+        data = await request.json()
+        old_path = data.get("old_path", "")
+        new_name = data.get("new_name", "")
+
+        if not old_path or not os.path.isabs(old_path) or not os.path.isfile(old_path):
+            return server.web.json_response({"status": "error", "message": "Invalid source file."}, status=400)
+        if not new_name or "/" in new_name or "\\" in new_name:
+            return server.web.json_response({"status": "error", "message": "Invalid new filename."}, status=400)
+
+        directory = os.path.dirname(old_path)
+        new_path = os.path.join(directory, new_name)
+
+        if old_path == new_path:
+            return server.web.json_response({"status": "ok", "new_path": new_path})
+        if os.path.exists(new_path):
+            return server.web.json_response({"status": "error", "message": "A file with that name already exists."}, status=409)
+
+        os.rename(old_path, new_path)
+        return server.web.json_response({"status": "ok", "new_path": new_path})
+    except Exception as e:
+        return server.web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+@server.PromptServer.instance.routes.post("/meta-prompt-extractor/save-mask")
+async def _mpe_save_mask(request):
+    """Save mask PNG alongside the source image (or in ComfyUI input dir)."""
+    try:
+        data = await request.json()
+        image_path = data.get("image_path", "")
+        mask_data_b64 = data.get("mask_data", "")
+
+        if not image_path or not mask_data_b64:
+            return server.web.json_response({"status": "error", "message": "Missing parameters."}, status=400)
+
+        filename = os.path.basename(image_path)
+        name, _ = os.path.splitext(filename)
+        mask_filename = f"{name}_mask.png"
+
+        # Prefer saving next to the image; fall back to ComfyUI input dir.
+        image_dir = os.path.dirname(image_path)
+        if os.path.isdir(image_dir):
+            mask_path = os.path.join(image_dir, mask_filename)
+        else:
+            mask_path = os.path.join(folder_paths.get_input_directory(), mask_filename)
+
+        raw = _base64.b64decode(mask_data_b64.split(",")[1])
+        img = Image.open(io.BytesIO(raw))
+        if "A" in img.getbands():
+            mask_img = img.split()[-1]
+        else:
+            mask_img = img.convert("L")
+
+        # If the mask is completely empty, delete any existing mask file.
+        extrema = mask_img.getextrema()
+        if extrema and extrema[1] == 0:
+            if os.path.exists(mask_path):
+                os.remove(mask_path)
+            return server.web.json_response({"status": "ok", "message": "Empty mask — file cleared."})
+
+        mask_img.save(mask_path, "PNG")
+        return server.web.json_response({"status": "ok", "mask_path": mask_path})
+    except Exception as e:
+        return server.web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+@server.PromptServer.instance.routes.post("/meta-prompt-extractor/get-mask-path")
+async def _mpe_get_mask_path(request):
+    """Return the path to the mask file for a given image, if it exists."""
+    try:
+        data = await request.json()
+        image_path = data.get("image_path", "")
+        if not image_path:
+            return server.web.json_response({"status": "error", "message": "Missing image_path."}, status=400)
+
+        filename = os.path.basename(image_path)
+        name, _ = os.path.splitext(filename)
+        mask_filename = f"{name}_mask.png"
+
+        # Check next to image first.
+        candidate = os.path.join(os.path.dirname(image_path), mask_filename)
+        if os.path.exists(candidate):
+            return server.web.json_response({"status": "ok", "mask_path": candidate})
+
+        # Fall back to ComfyUI input dir.
+        input_candidate = os.path.join(folder_paths.get_input_directory(), mask_filename)
+        if os.path.exists(input_candidate):
+            return server.web.json_response({"status": "ok", "mask_path": input_candidate})
+
+        return server.web.json_response({"status": "ok", "mask_path": None})
+    except Exception as e:
+        return server.web.json_response({"status": "error", "message": str(e)}, status=500)
+
 
 NODE_CLASS_MAPPINGS = {
     "MetaPromptExtractor": MetaPromptExtractor
