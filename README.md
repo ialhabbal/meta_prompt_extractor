@@ -469,6 +469,9 @@ When you load an image created with Stable Diffusion WebUI (A1111 or Forge), the
 
 ## Changelog
 
+### 2.0.0
+- New Features Added
+
 ### 1.8.0
 - Browse Files window now scrolls to and highlights the last selected image when reopened
 - Fixed: mask and path output ports disappearing after ComfyUI restart
