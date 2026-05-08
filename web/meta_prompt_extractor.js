@@ -3615,6 +3615,18 @@ app.registerExtension({
                 window._mpe_nodeRegistry.add(node);
             }
 
+            // ── Ensure both conditioning optional input slots exist ──
+            // These slots must be present from the very first frame so the serialiser
+            // saves them and ComfyUI can reconnect wires on graph restore.
+            const _hasCondInput = node.inputs?.some(inp => inp.name === "conditioning");
+            if (!_hasCondInput) {
+                node.addInput("conditioning", "CONDITIONING");
+            }
+            const _hasCondNegInput = node.inputs?.some(inp => inp.name === "conditioning_negative");
+            if (!_hasCondNegInput) {
+                node.addInput("conditioning_negative", "CONDITIONING");
+            }
+
             // ── Debug: Log all widgets ──
             console.log("[MetaPromptExtractor] onNodeCreated - widgets:", node.widgets?.map(w => ({ name: w.name, type: w.type, value: w.value })) || "NO WIDGETS");
             console.log("[MetaPromptExtractor] Node inputs:", node.inputs?.map(i => ({ name: i.name, type: i.type })) || "NO INPUTS");
@@ -3713,6 +3725,52 @@ app.registerExtension({
             };
             node.widgets.splice(imageWidgetIndex + 1, 0, browseButton);
 
+            // ── use_conditioning toggle widget ──────────────────────────────────
+            // This boolean widget sits below the two conditioning input slots on
+            // the node.  It controls whether conditioning extraction takes priority
+            // over file-based extraction at execution time.
+            //
+            // Auto-behaviour (wired via onConnectionsChange below):
+            //   • A conditioning wire is connected  → toggle turns ON automatically
+            //   • All conditioning wires removed    → toggle turns OFF automatically
+            //   • User manually turns OFF            → stays OFF even if wires present
+            // The use_conditioning boolean is supplied by the Python node definition.
+            // We do not create a second, redundant toggle here.
+
+            // Helper: check whether any conditioning input has a live link
+            const _anyCondConnected = () => {
+                return node.inputs?.some(
+                    inp => (inp.name === "conditioning" || inp.name === "conditioning_negative")
+                           && inp.link != null
+                );
+            };
+
+            // ── onConnectionsChange — auto-manage the toggle ────────────────────
+            const origConnectionsChange = node.onConnectionsChange;
+            node.onConnectionsChange = function(type, index, connected, link_info) {
+                if (origConnectionsChange) origConnectionsChange.apply(this, arguments);
+
+                const inp = this.inputs?.[index];
+                const isCondSlot = inp && (
+                    inp.name === "conditioning" || inp.name === "conditioning_negative"
+                );
+                if (!isCondSlot) return;
+
+                const toggle = this.widgets?.find(w => w.name === "use conditioning" || w.name === "use_conditioning");
+                if (!toggle) return;
+
+                if (connected) {
+                    // A conditioning wire was just connected — turn the toggle ON
+                    toggle.value = true;
+                } else {
+                    // A wire was removed — turn OFF only if no conditioning remains
+                    if (!_anyCondConnected()) {
+                        toggle.value = false;
+                    }
+                }
+                this.setDirtyCanvas(true);
+            };
+
             // ── onConfigure: restore preview when workflow is loaded ──
             const origConfigure = node.onConfigure;
             node.onConfigure = function(info) {
@@ -3773,10 +3831,37 @@ app.registerExtension({
                     }
                 }
                 
-                // Now safe to remove inputs since we've converted them to widgets
+                // Remove spurious inputs that ComfyUI may have re-created from serialised data,
+                // but preserve both conditioning slots — they are legitimate optional inputs.
                 if (this.inputs) {
-                    console.log("[MetaPromptExtractor] Removing inputs, count:", this.inputs.length);
-                    for (let i = this.inputs.length - 1; i >= 0; i--) this.removeInput(i);
+                    const KEEP_INPUTS = new Set(["conditioning", "conditioning_negative"]);
+                    for (let i = this.inputs.length - 1; i >= 0; i--) {
+                        if (!KEEP_INPUTS.has(this.inputs[i]?.name)) {
+                            this.removeInput(i);
+                        }
+                    }
+                    // Ensure both conditioning slots exist (recreate if missing)
+                    if (!this.inputs.some(inp => inp.name === "conditioning")) {
+                        this.addInput("conditioning", "CONDITIONING");
+                    }
+                    if (!this.inputs.some(inp => inp.name === "conditioning_negative")) {
+                        this.addInput("conditioning_negative", "CONDITIONING");
+                    }
+                }
+
+                // ── Ensure use_conditioning toggle widget exists ──────────────────
+                const hasToggle = this.widgets?.some(w => w.name === "use conditioning" || w.name === "use_conditioning");
+                if (!hasToggle) {
+                    const toggleWidget = {
+                        name:      "use_conditioning",
+                        type:      "toggle",
+                        value:     false,
+                        serialize: true,
+                        options:   { on: "", off: "" },
+                        callback:  function(v) { node.setDirtyCanvas(true); },
+                    };
+                    if (!this.widgets) this.widgets = [];
+                    this.widgets.push(toggleWidget);
                 }
 
                 // ── Ensure Browse button exists ──

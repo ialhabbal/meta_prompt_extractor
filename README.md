@@ -19,6 +19,12 @@ A ComfyUI custom node that reads the prompts hidden inside your AI-generated ima
 ### Full File Picker for Copy/Move Functions
 ![meta_prompt_extractor](https://raw.githubusercontent.com/ialhabbal/meta_prompt_extractor/main/media/full_file_picker_for_copy_move_functions.png)
 
+### Conditioning Input
+![meta_prompt_extractor](https://raw.githubusercontent.com/ialhabbal/meta_prompt_extractor/main/media/conditioning_input_function.png)
+
+### Conditioning Input Collapsed
+![meta_prompt_extractor](https://raw.githubusercontent.com/ialhabbal/meta_prompt_extractor/main/media/conditioning_input_function1.png)
+
 ---
 
 ## What It Does
@@ -30,6 +36,8 @@ Point the node at any PNG, JPG, WebP, or JSON file and it outputs five things yo
 - **Image** — The image itself as a ComfyUI tensor, ready to pipe into any image node
 - **Mask** — A mask you painted in the built-in Mask Editor, ready for inpainting
 - **Path** — The full file path as a string, useful for logging or chaining into save nodes
+- **Conditioning** — Accepts an input from previous ClipTextEncode positive. 
+- **Conditioning Negative** — Accepts an input from previous ClipTextEncode Negative.
 
 Beyond extraction, the node includes a self-contained file management system with these capabilities:
 
@@ -468,6 +476,10 @@ When you load an image created with Stable Diffusion WebUI (A1111 or Forge), the
 ---
 
 ## Changelog
+
+### 2.5.0
+- Added two new Conditioning inputs for positive and negatie prompts from previous ClipTextEncode
+- Added a on/off toggle to turn on/off the conditioninng functionality
 
 ### 2.0.0
 - New Features Added

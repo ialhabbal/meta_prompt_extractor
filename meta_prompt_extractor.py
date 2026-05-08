@@ -1320,6 +1320,146 @@ async def _extract_preview_abs(request):
 
 # ── ComfyUI Node Class ────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Conditioning → text extraction via graph traversal
+#
+# ComfyUI conditioning is [[cond_tensor, {"pooled_output": pooled_tensor}], ...]
+# The text that was encoded is NOT stored in the conditioning dict — it is
+# baked into the tensor and is not recoverable from the tensor alone.
+#
+# The correct approach is to use the API-format prompt graph that ComfyUI
+# injects via the hidden "PROMPT" input, along with the node's own unique_id,
+# to find which upstream node feeds the conditioning slot and then walk
+# backwards through the graph using the existing _resolve_prompt_api logic
+# to read the text widget value of the upstream CLIPTextEncode (or equivalent).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_source_node_for_conditioning(unique_id, prompt_graph, input_slot_name="conditioning"):
+    """
+    Given the unique_id of the MetaPromptExtractor node and the full
+    API-format prompt graph (dict of node_id -> node_data), find the node_id
+    of whichever node is connected to the named conditioning input slot.
+
+    ComfyUI API format stores inputs as either:
+      - a plain value  (string / int / float)
+      - a connection   [source_node_id, source_output_slot_index]
+
+    Returns the source node_id string, or None if no connection is found.
+    """
+    if not prompt_graph or not unique_id:
+        return None
+
+    own_node = prompt_graph.get(str(unique_id))
+    if not own_node or not isinstance(own_node, dict):
+        return None
+
+    inputs = own_node.get("inputs", {})
+    cond_ref = inputs.get(input_slot_name)
+
+    # A connection reference is [node_id, output_slot] where node_id is an int
+    # and output_slot is an int (0-based index of which output of that node).
+    if (isinstance(cond_ref, (list, tuple))
+            and len(cond_ref) == 2
+            and isinstance(cond_ref[0], (int, str))
+            and isinstance(cond_ref[1], int)):
+        return str(cond_ref[0])
+
+    return None
+
+
+def extract_prompts_from_conditioning_via_graph(conditioning, unique_id, prompt_graph,
+                                                input_slot_name="conditioning"):
+    """
+    Extract the text prompt that was encoded into `conditioning` by walking
+    backwards through the ComfyUI API-format prompt graph.
+
+    Args:
+        conditioning      : the CONDITIONING value (used only to confirm
+                            something is connected; text is NOT in the tensor).
+        unique_id         : this node's unique_id string (hidden UNIQUE_ID).
+        prompt_graph      : full API-format prompt dict (hidden PROMPT input).
+        input_slot_name   : which input slot to trace — "conditioning" for the
+                            positive slot, "conditioning_negative" for the
+                            negative slot.
+
+    Returns:
+        (positive_text, negative_text) — either or both may be empty strings.
+    """
+    positive_text = ""
+    negative_text = ""
+
+    if conditioning is None or not prompt_graph:
+        return positive_text, negative_text
+
+    # Step 1 — find which upstream node feeds this conditioning slot
+    source_node_id = _find_source_node_for_conditioning(
+        unique_id, prompt_graph, input_slot_name
+    )
+    if not source_node_id:
+        print(f"{TAG} [conditioning] Could not find upstream node for slot '{input_slot_name}'.")
+        return positive_text, negative_text
+
+    source_node = prompt_graph.get(source_node_id, {})
+    source_class = source_node.get("class_type", "")
+    print(f"{TAG} [conditioning] Slot '{input_slot_name}' → node id={source_node_id} class_type={source_class!r}")
+
+    # Step 2 — determine polarity.
+    # For the explicit negative slot, always treat as negative regardless of
+    # the upstream node's class.  For the positive slot, apply a class check.
+    KNOWN_NEGATIVE_CLASSES = {
+        "CLIPTextEncodeNegative",
+        "ConditioningNegative",
+    }
+    if input_slot_name == "conditioning_negative":
+        is_negative = True
+    else:
+        is_negative = source_class in KNOWN_NEGATIVE_CLASSES
+
+    # Step 3 — walk backwards through the graph to find the text
+    extracted = _resolve_prompt_api(source_node_id, prompt_graph, set())
+
+    if extracted:
+        if is_negative:
+            negative_text = extracted
+        else:
+            positive_text = extracted
+        print(f"{TAG} [conditioning] Extracted {'negative' if is_negative else 'positive'} prompt "
+              f"from slot '{input_slot_name}': {extracted[:80]!r}{'...' if len(extracted) > 80 else ''}")
+    else:
+        print(f"{TAG} [conditioning] No text found walking upstream from node {source_node_id}.")
+
+    return positive_text, negative_text
+
+
+def _extract_text_from_cond_dict(conditioning):
+    """
+    Last-resort fallback: some custom nodes DO store the prompt string directly
+    in the conditioning dict under non-standard keys.  Check a broad list of
+    candidates.  Returns the first non-empty string found, or "".
+    """
+    if not conditioning or not isinstance(conditioning, (list, tuple)):
+        return ""
+    for entry in conditioning:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        cond_dict = entry[1]
+        if not isinstance(cond_dict, dict):
+            continue
+        for key in ("text", "prompt", "cond_text", "positive", "encoded_text",
+                    "caption", "description"):
+            val = cond_dict.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        # Some flux-style encoders nest the text inside pooled_output
+        pooled = cond_dict.get("pooled_output")
+        if isinstance(pooled, dict):
+            for key in ("text", "prompt"):
+                val = pooled.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    return ""
+
+
 class MetaPromptExtractor:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1329,9 +1469,39 @@ class MetaPromptExtractor:
                     "tooltip": "Absolute path to a file. Use the Browse button.",
                 }),
             },
+            "optional": {
+                "conditioning": ("CONDITIONING", {
+                    "tooltip": (
+                        "Optional positive conditioning input. Connect a CLIPTextEncode "
+                        "(or equivalent) node here. When 'use conditioning' is ON the "
+                        "extracted text is forwarded to the positive_prompt output, "
+                        "overriding any file-based extraction."
+                    ),
+                }),
+                "conditioning_negative": ("CONDITIONING", {
+                    "tooltip": (
+                        "Optional negative conditioning input. Connect a CLIPTextEncode "
+                        "(or equivalent) node here. When 'use conditioning' is ON the "
+                        "extracted text is forwarded to the negative_prompt output, "
+                        "overriding any file-based extraction."
+                    ),
+                }),
+                "use_conditioning": ("BOOLEAN", {
+                    "default": False,
+                    "label_on":  "",
+                    "label_off": "",
+                    "tooltip": (
+                        "When ON: conditioning inputs take priority over file-based "
+                        "extraction. Turns ON automatically when a conditioning input "
+                        "is connected. Turn OFF to fall back to Browse Files extraction "
+                        "even if conditioning inputs are connected."
+                    ),
+                }),
+            },
             "hidden": {
-                "unique_id":    "UNIQUE_ID",
+                "unique_id":     "UNIQUE_ID",
                 "extra_pnginfo": "EXTRA_PNGINFO",
+                "prompt":        "PROMPT",
             },
         }
 
@@ -1349,51 +1519,142 @@ class MetaPromptExtractor:
     def VALIDATE_INPUTS(cls, **kwargs):
         return True
 
-    def extract(self, image="", unique_id=None,
-                extra_pnginfo=None, **kwargs):
+    def extract(self, image="", conditioning=None, conditioning_negative=None,
+                use_conditioning=False, unique_id=None,
+                extra_pnginfo=None, prompt=None, **kwargs):
         positive_prompt = ""
         negative_prompt = ""
         image_tensor    = None
 
+        # ── Determine whether conditioning extraction is active ────────────────
+        # Conditioning takes priority when:
+        #   • use_conditioning is True (either set manually or auto-set by the
+        #     JS when a connection is made), AND
+        #   • at least one conditioning input is actually connected.
+        any_cond_connected = (conditioning is not None
+                              or conditioning_negative is not None)
+        use_cond_active = bool(use_conditioning) and any_cond_connected
+
+        # ── Step 1: File-based extraction ──────────────────────────────────────
+        # Always run so we always have a valid image tensor to display/output.
+        # The text results are only used when conditioning is NOT active.
         file_path = (image or "").strip()
-        # Smart Path Fallback: return input dir path when no file is selected
         fallback_path = folder_paths.get_input_directory()
-        if file_path in ("", "(none)"):
-            return positive_prompt, negative_prompt, _placeholder_tensor(), _placeholder_mask(), fallback_path
 
         resolved = None
-        if os.path.isabs(file_path):
-            resolved = file_path if os.path.isfile(file_path) else None
+        if file_path and file_path not in ("", "(none)"):
+            if os.path.isabs(file_path):
+                resolved = file_path if os.path.isfile(file_path) else None
+            else:
+                for base in (folder_paths.get_input_directory(),
+                             folder_paths.get_output_directory(),
+                             folder_paths.get_temp_directory()):
+                    candidate = os.path.join(base, file_path)
+                    if os.path.isfile(candidate):
+                        resolved = candidate
+                        break
+
+        file_positive = ""
+        file_negative = ""
+        if resolved and not use_cond_active:
+            ext = os.path.splitext(resolved)[1].lower()
+            prompt_data  = None
+            workflow_raw = None
+
+            if ext == ".png":
+                prompt_data, workflow_raw = extract_metadata_from_png(resolved)
+                image_tensor = load_image_as_tensor(resolved)
+            elif ext in (".jpg", ".jpeg", ".webp"):
+                prompt_data, workflow_raw = extract_metadata_from_jpeg(resolved)
+                image_tensor = load_image_as_tensor(resolved)
+            elif ext == ".json":
+                prompt_data, workflow_raw = extract_metadata_from_json(resolved)
+
+            if prompt_data or workflow_raw:
+                parsed        = parse_workflow_for_prompts(prompt_data, workflow_raw)
+                file_positive = parsed.get("positive_prompt") or ""
+                file_negative = parsed.get("negative_prompt") or ""
         else:
-            for base in (folder_paths.get_input_directory(),
-                         folder_paths.get_output_directory(),
-                         folder_paths.get_temp_directory()):
-                candidate = os.path.join(base, file_path)
-                if os.path.isfile(candidate):
-                    resolved = candidate
-                    break
+            resolved = None
 
+        # ── Step 2: Conditioning-based extraction ──────────────────────────────
+        # The CONDITIONING tensor does NOT store the original text — the text is
+        # encoded into a float tensor and cannot be decoded back.
+        #
+        # We use the API-format prompt graph (injected via the hidden "PROMPT"
+        # input) to locate our own node, identify which upstream nodes are wired
+        # to our conditioning slots, then walk backwards with _resolve_prompt_api
+        # to read the text widget values of those upstream encoder nodes.
+        cond_positive = ""
+        cond_negative = ""
+
+        if any_cond_connected:
+            # Build the prompt graph
+            prompt_graph = None
+            if isinstance(prompt, dict) and prompt:
+                prompt_graph = prompt
+            elif (isinstance(extra_pnginfo, dict)
+                  and "workflow" in extra_pnginfo
+                  and isinstance(extra_pnginfo["workflow"], dict)):
+                wf = extra_pnginfo["workflow"]
+                prompt_graph = convert_workflow_to_prompt_format(wf) or None
+
+            if prompt_graph:
+                # Positive conditioning slot
+                if conditioning is not None:
+                    cond_pos_raw, _ = extract_prompts_from_conditioning_via_graph(
+                        conditioning, unique_id, prompt_graph,
+                        input_slot_name="conditioning"
+                    )
+                    cond_positive = cond_pos_raw
+
+                # Negative conditioning slot — separate graph lookup using its
+                # own slot name so _find_source_node_for_conditioning reads the
+                # correct input key from our node's entry in the graph.
+                if conditioning_negative is not None:
+                    _, cond_neg_raw = extract_prompts_from_conditioning_via_graph(
+                        conditioning_negative, unique_id, prompt_graph,
+                        input_slot_name="conditioning_negative"
+                    )
+                    # The helper returns (pos, neg) based on polarity detection;
+                    # since this is explicitly the negative slot, treat anything
+                    # found as negative regardless of polarity heuristic.
+                    if not cond_neg_raw:
+                        # Polarity heuristic may have put it in "positive" side —
+                        # re-run and take whatever came back
+                        cond_neg_raw_pos, cond_neg_raw_neg =                             extract_prompts_from_conditioning_via_graph(
+                                conditioning_negative, unique_id, prompt_graph,
+                                input_slot_name="conditioning_negative"
+                            )
+                        cond_neg_raw = cond_neg_raw_neg or cond_neg_raw_pos
+                    cond_negative = cond_neg_raw
+
+            else:
+                # Last resort: some custom nodes store text in the cond dict
+                if conditioning is not None:
+                    cond_positive = _extract_text_from_cond_dict(conditioning)
+                if conditioning_negative is not None:
+                    cond_negative = _extract_text_from_cond_dict(conditioning_negative)
+                if cond_positive or cond_negative:
+                    print(f"{TAG} [conditioning] Recovered text from cond dict (no graph).")
+
+        # ── Step 3: Merge results according to priority ────────────────────────
+        if use_cond_active:
+            # Conditioning takes full priority — overrides file entirely
+            positive_prompt = cond_positive
+            negative_prompt = cond_negative
+            print(f"{TAG} [conditioning] Using conditioning extraction (toggle ON).")
+        else:
+            # File-based only (conditioning idle or toggled off)
+            positive_prompt = file_positive
+            negative_prompt = file_negative
+
+        # ── Step 4: Return results ─────────────────────────────────────────────
         if not resolved:
-            return positive_prompt, negative_prompt, _placeholder_tensor(), _placeholder_mask(), fallback_path
-
-        ext = os.path.splitext(resolved)[1].lower()
-
-        prompt_data  = None
-        workflow_raw = None
-
-        if ext == ".png":
-            prompt_data, workflow_raw = extract_metadata_from_png(resolved)
-            image_tensor = load_image_as_tensor(resolved)
-        elif ext in (".jpg", ".jpeg", ".webp"):
-            prompt_data, workflow_raw = extract_metadata_from_jpeg(resolved)
-            image_tensor = load_image_as_tensor(resolved)
-        elif ext == ".json":
-            prompt_data, workflow_raw = extract_metadata_from_json(resolved)
-
-        if prompt_data or workflow_raw:
-            parsed          = parse_workflow_for_prompts(prompt_data, workflow_raw)
-            positive_prompt = parsed.get("positive_prompt") or ""
-            negative_prompt = parsed.get("negative_prompt") or ""
+            if image_tensor is None:
+                image_tensor = _placeholder_tensor()
+            mask_tensor = _placeholder_mask()
+            return positive_prompt, negative_prompt, image_tensor, mask_tensor, fallback_path
 
         if image_tensor is None:
             image_tensor = _placeholder_tensor()
@@ -1410,7 +1671,7 @@ class MetaPromptExtractor:
         return positive_prompt, negative_prompt, image_tensor, mask_tensor, resolved
 
     @classmethod
-    def IS_CHANGED(cls, image="", **kwargs):
+    def IS_CHANGED(cls, image="", conditioning=None, conditioning_negative=None, use_conditioning=False, prompt=None, **kwargs):
         # Build a hash of: image mtime + mask mtime (if any).
         # This ensures ComfyUI re-executes whenever the mask is saved/cleared,
         # not only when the image itself changes.
