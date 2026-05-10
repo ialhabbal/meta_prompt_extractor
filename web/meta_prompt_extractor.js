@@ -296,7 +296,7 @@ function _openFolderPickerDialog(title = 'Select a folder') {
         const navigateTo = async (path, pushHistory = true) => {
             mainPanel.innerHTML = '<div style="color:#7a9ab8;font-size:13px;padding:24px;text-align:center;">Loading…</div>';
             try {
-                const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(path)}`);
+                const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(path)}&type=folders`);
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const data = await resp.json();
 
@@ -373,7 +373,7 @@ function _openFolderPickerDialog(title = 'Select a folder') {
                             childContainer.innerHTML = '<div style="color:#5a7a98;font-size:12px;padding:4px 8px;">Loading…</div>';
                             row.insertAdjacentElement('afterend', childContainer);
                             try {
-                                const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(d.path)}`);
+                                const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(d.path)}&type=folders`);
                                 const data = await resp.json();
                                 childContainer.innerHTML = '';
                                 const subs = (data.entries || []).filter(s => s.type === 'dir');
@@ -453,7 +453,7 @@ function _openFolderPickerDialog(title = 'Select a folder') {
                         childContainer.innerHTML = '<div style="color:#5a7a98;font-size:12px;padding:3px 8px;">Loading…</div>';
                         row.insertAdjacentElement('afterend', childContainer);
                         try {
-                            const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(entry.path)}`);
+                            const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(entry.path)}&type=folders`);
                             const data = await resp.json();
                             childContainer.innerHTML = '';
                             const subs = (data.entries || []).filter(s => s.type === 'dir');
@@ -544,7 +544,7 @@ function _openFolderPickerDialog(title = 'Select a folder') {
             // ── Quick Access: home directory ──
             addSection('Quick Access');
             try {
-                const r = await fetch('/meta-prompt-extractor/browse');
+                const r = await fetch('/meta-prompt-extractor/browse?type=folders');
                 const d = await r.json();
                 if (d.current) {
                     addRow('🏠', 'Home', d.current);
@@ -664,7 +664,7 @@ function _openFolderPickerDialog(title = 'Select a folder') {
         // ── Bootstrap ─────────────────────────────────────────────────────────
         buildSidebar().then(() => {
             // Start at home directory
-            fetch('/meta-prompt-extractor/browse')
+            fetch('/meta-prompt-extractor/browse?type=folders')
                 .then(r => r.json())
                 .then(d => navigateTo(d.current, false))
                 .catch(() => navigateTo('/', false));
@@ -2661,7 +2661,7 @@ async function createFileBrowserModal(currentFile, onSelect) {
         return (path) => {
             const task = _queue.then(async () => {
                 try {
-                    const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(path)}`);
+                    const resp = await fetch(`/meta-prompt-extractor/browse?path=${encodeURIComponent(path)}&type=folders`);
                     if (!resp.ok) return [];
                     const data = await resp.json();
                     if (!data.entries) return [];

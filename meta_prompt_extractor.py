@@ -1128,19 +1128,26 @@ async def _browse_filesystem(request):
     IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
     try:
         path = request.rel_url.query.get("path", "") or os.path.expanduser("~")
+        browse_type = request.rel_url.query.get("type", "files")  # "files" or "folders"
         path = os.path.normpath(path)
         if not os.path.isdir(path):
             return server.web.json_response({"error": "Not a directory"}, status=400)
 
         # Clear per-directory metadata cache so it never grows unbounded
-        _has_metadata_cache.clear()
+        if browse_type != "folders":
+            _has_metadata_cache.clear()
 
         entries = []
         try:
             for name in sorted(os.listdir(path), key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower())):
                 full  = os.path.join(path, name)
                 is_dir = os.path.isdir(full)
+                
+                if browse_type == "folders" and not is_dir:
+                    continue  # Skip files when browsing folders only
+                
                 ext   = os.path.splitext(name)[1].lower()
+                
                 if is_dir:
                     entries.append({"name": name, "path": full, "type": "dir"})
                 elif ext in SUPPORTED:

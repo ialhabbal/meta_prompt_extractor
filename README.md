@@ -477,6 +477,9 @@ When you load an image created with Stable Diffusion WebUI (A1111 or Forge), the
 
 ## Changelog
 
+### 2.5.1
+- Improved the operation of loading image folders inside Browse Files floating window.
+
 ### 2.5.0
 - Added two new Conditioning inputs for positive and negatie prompts from previous ClipTextEncode
 - Added a on/off toggle to turn on/off the conditioninng functionality
